@@ -25,6 +25,7 @@ import {
   PROTOCOL_VERSION,
   parseMessage,
   RESULTS_STREAM_NAME,
+  type Result,
   ResultSchema,
   resultSubject,
   STATE_STREAM_NAME,
@@ -46,6 +47,12 @@ const CONSUMER_ALREADY_EXISTS = 10148
 
 export const ALREADY_RECORDED =
   'already recorded: another session finished this task first, so this result was not stored'
+
+export const ALREADY_CLOSED =
+  'already closed: the run timeout ended this task, so this call stored nothing. Stop working on it'
+
+export const RELEASED =
+  'released: this was not accepted in time, so it will be redelivered and this was not stored'
 
 export const WORKER_TOOLS = [
   {
@@ -78,8 +85,19 @@ interface InFlight {
   /** Swapped when the broker redelivers this task to this process. */
   msg: JsMsg
   working: ReturnType<typeof setInterval>
+  /** The accept timer until the first tool call, then the run timer. */
+  deadline: ReturnType<typeof setTimeout>
+  accepted: boolean
+  /** finish_task or the run timeout is writing the result. Never both. */
   finishing: boolean
 }
+
+/**
+ * What holds a task's result subject after a store: this call's write, an
+ * earlier write of this session (its finish_task, or a result the plugin
+ * decided on), or anything else, which is taken for another session's.
+ */
+type Stored = 'written' | 'own_finish' | 'own_failure' | 'other'
 
 export interface ToolResult {
   [key: string]: unknown
@@ -110,7 +128,7 @@ const isNoResponders = (err: unknown) => {
 export interface Worker {
   /** Call once MCP is `initialized`; pulling begins after the startup grace. */
   start(): void
-  /** Stops the consume loop and the timers. An unacked task returns by ack_wait. */
+  /** Stops the consume loop and the timers, and hands back a task in flight. */
   stop(): Promise<void>
   callTool(
     name: string,
@@ -139,6 +157,11 @@ export function createWorker({
   let loop: Promise<void> | undefined
   let messages: ConsumerMessages | undefined
   let inFlight: InFlight | undefined
+  // Set by the accept timeout, and keeps this session from pulling until a tool
+  // call for that task clears it. S7 reports this as presence `stalled`.
+  let released: string | undefined
+  // The answer to late tool calls for tasks the run timeout ended.
+  const closed = new Map<unknown, ToolResult>()
   const missingStreams = new Set<string>()
 
   // Resolves early, not rejects, on stop(): every caller rechecks the signal.
@@ -158,13 +181,32 @@ export function createWorker({
       }
     }, timers.working)
 
-  function hold(task: Task, msg: JsMsg, attempt: number): InFlight {
+  // Best effort: a lost nak only means the task returns after ack_wait.
+  function handBack(msg: JsMsg): void {
+    try {
+      msg.nak()
+    } catch (err) {
+      log(`nak failed: ${describeError(err)}`)
+    }
+  }
+
+  function hold(
+    nc: NatsConnection,
+    task: Task,
+    msg: JsMsg,
+    attempt: number,
+  ): InFlight {
     const held: InFlight = {
       task,
       msg,
       attempt,
+      accepted: false,
       finishing: false,
       working: keepWorking(() => held.msg),
+      deadline: setTimeout(
+        () => releaseUnaccepted(nc, held),
+        timers.acceptTimeout,
+      ),
     }
     inFlight = held
     return held
@@ -172,7 +214,88 @@ export function createWorker({
 
   function release(held: InFlight): void {
     clearInterval(held.working)
+    clearTimeout(held.deadline)
     if (inFlight === held) inFlight = undefined
+  }
+
+  /** Plan 3.3, no delivery ack: either the session is deaf or it is too busy. */
+  function releaseUnaccepted(nc: NatsConnection, held: InFlight): void {
+    released = held.task.task_id
+    // Pulling stops first, or the nak hands the task straight back here.
+    messages?.stop()
+    release(held)
+    log(`task ${held.task.task_id} not accepted in time, released`)
+    try {
+      publishStatus(nc, held, 'released')
+    } catch (err) {
+      log(`released status failed: ${describeError(err)}`)
+    }
+    handBack(held.msg)
+  }
+
+  function armRunTimer(nc: NatsConnection, held: InFlight, ms: number): void {
+    held.deadline = setTimeout(() => {
+      closeTimedOut(nc, held).catch((err: unknown) => {
+        log(`run timeout failed: ${describeError(err)}`)
+      })
+    }, ms)
+  }
+
+  // Any tool call proves Claude has the task, even one rejected further on.
+  function accept(nc: NatsConnection, held: InFlight): void {
+    if (held.accepted) return
+    held.accepted = true
+    clearTimeout(held.deadline)
+    armRunTimer(nc, held, held.task.timeout_s * 1000)
+  }
+
+  async function closeTimedOut(
+    nc: NatsConnection,
+    held: InFlight,
+  ): Promise<void> {
+    // finish_task got here first. Stored, it clears this timer; failed, the
+    // task still needs its result, so look again.
+    if (held.finishing) {
+      armRunTimer(nc, held, timers.restartMin)
+      return
+    }
+    const { task, attempt } = held
+    held.finishing = true
+    closed.set(task.task_id, toolError(ALREADY_CLOSED))
+    const stored = await storeFailure(
+      nc,
+      held.msg,
+      task.task_id,
+      attempt,
+      'timeout',
+      `no finish_task within timeout_s (${task.timeout_s})`,
+    )
+    if (stored === undefined) return
+    recordFinished(nc, held)
+    // Its PubAck was lost, but the finish_task landed: nothing timed out.
+    if (stored === 'own_finish') {
+      closed.set(task.task_id, reply('finished'))
+      held.msg.ack()
+      release(held)
+      return
+    }
+    if (stored === 'other') {
+      closed.set(task.task_id, toolError(ALREADY_RECORDED))
+    }
+    held.msg.term('timeout')
+    release(held)
+    try {
+      await push(
+        sanitizeContent(`Timed out, stop working on: ${task.title}`),
+        buildMeta({
+          kind: 'task_closed',
+          task_id: task.task_id,
+          reason: 'timeout',
+        }),
+      )
+    } catch (err) {
+      log(`task_closed push failed: ${describeError(err)}`)
+    }
   }
 
   function statusBytes(
@@ -202,7 +325,7 @@ export function createWorker({
   // Core publish: losing one of these is fine. `delivered` is not, see deliver().
   function publishStatus(
     nc: NatsConnection,
-    held: InFlight,
+    held: Pick<InFlight, 'task' | 'attempt'>,
     state: Status['state'],
     note?: unknown,
   ): void {
@@ -210,6 +333,19 @@ export function createWorker({
       statusSubject(config.name, held.task.task_id),
       statusBytes(held, state, note),
     )
+  }
+
+  // Closes the ledger row of a result the plugin stored. Lost, the row is only
+  // stale: readers treat a stored result as terminal whatever the row says.
+  function recordFinished(
+    nc: NatsConnection,
+    held: Pick<InFlight, 'task' | 'attempt'>,
+  ): void {
+    try {
+      publishStatus(nc, held, 'finished')
+    } catch (err) {
+      log(`finished status failed: ${describeError(err)}`)
+    }
   }
 
   async function lastMessage(
@@ -243,15 +379,14 @@ export function createWorker({
     )
 
   /**
-   * First result wins. Returns false when the stored result is not the one
-   * this call wrote. Anything else throws, and the result may or may not be
-   * stored: a timed-out publish can still land.
+   * First result wins, and this says whose it is. Anything else throws, and
+   * the result may or may not be stored: a timed-out publish can still land.
    */
   async function storeResult(
     nc: NatsConnection,
     taskId: string,
     bytes: Uint8Array,
-  ): Promise<boolean> {
+  ): Promise<Stored> {
     const subject = resultSubject(config.name, taskId)
     try {
       const ack = await onStream(RESULTS_STREAM_NAME, () =>
@@ -260,7 +395,7 @@ export function createWorker({
           expect: { lastSubjectSequence: 0 },
         }),
       )
-      if (!ack.duplicate) return true
+      if (!ack.duplicate) return 'written'
     } catch (err) {
       if (!isApiError(err, JetStreamApiCodes.StreamWrongLastSequence)) throw err
     }
@@ -270,12 +405,14 @@ export function createWorker({
     const stored = await storedResult(nc, taskId)
     if (!stored) throw new Error('the stored result is gone, call again')
     const parsed = parseMessage(subject, stored.data)
-    return (
-      parsed.ok &&
-      parsed.envelope.type === 'result' &&
-      parsed.envelope.instance === instance &&
-      parsed.envelope.reason === undefined
-    )
+    if (
+      !parsed.ok ||
+      parsed.envelope.type !== 'result' ||
+      parsed.envelope.instance !== instance
+    ) {
+      return 'other'
+    }
+    return parsed.envelope.reason === undefined ? 'own_finish' : 'own_failure'
   }
 
   /**
@@ -304,6 +441,34 @@ export function createWorker({
     }
   }
 
+  /**
+   * Stores a result the plugin decided on, whoever else may be writing one.
+   * Undefined means stop() came first: nothing is stored, so no term().
+   */
+  function storeFailure(
+    nc: NatsConnection,
+    msg: JsMsg,
+    taskId: string,
+    attempt: number,
+    reason: NonNullable<Result['reason']>,
+    summary: string,
+  ): Promise<Stored | undefined> {
+    const result = encodeEnvelope({
+      v: PROTOCOL_VERSION,
+      type: 'result',
+      task_id: taskId,
+      worker: config.name,
+      instance,
+      attempt,
+      outcome: 'failed',
+      reason,
+      summary,
+      finished_at: new Date().toISOString(),
+    })
+    if (!result.ok) throw new WireError(result.issues.join('; '))
+    return retryHolding(msg, () => storeResult(nc, taskId, result.bytes))
+  }
+
   async function rejectTask(
     nc: NatsConnection,
     msg: JsMsg,
@@ -314,22 +479,14 @@ export function createWorker({
     // The held task's id must not get a result from here: it would pass for
     // this session's own when the real finish_task hits the stored subject.
     if (task_id && task_id !== inFlight?.task.task_id) {
-      const result = encodeEnvelope({
-        v: PROTOCOL_VERSION,
-        type: 'result',
+      const stored = await storeFailure(
+        nc,
+        msg,
         task_id,
-        worker: config.name,
-        instance,
         // Never pushed, so this is the first attempt however often it arrived.
-        attempt: 1,
-        outcome: 'failed',
-        reason: 'invalid_task',
-        summary: `rejected task envelope: ${[reason, ...issues].join('; ')}`,
-        finished_at: new Date().toISOString(),
-      })
-      if (!result.ok) throw new WireError(result.issues.join('; '))
-      const stored = await retryHolding(msg, () =>
-        storeResult(nc, task_id, result.bytes),
+        1,
+        'invalid_task',
+        `rejected task envelope: ${[reason, ...issues].join('; ')}`,
       )
       if (stored === undefined) return
     }
@@ -339,9 +496,10 @@ export function createWorker({
   /**
    * Attempts count pushes to Claude, not deliveries: the stored `delivered`
    * status written before each push is the record. Only no status, or the
-   * orchestrator's `queued`, means nothing was pushed yet. Anything else
-   * without a usable attempt falls back to `deliveryCount`, which can overcount
-   * but keeps `max_attempts` a real bound.
+   * orchestrator's `queued`, means nothing was pushed yet. A `released` push
+   * reached nobody, so it costs no attempt; a lost `released` overcounts by one.
+   * Anything else without a usable attempt falls back to `deliveryCount`, which
+   * can overcount but keeps `max_attempts` a real bound.
    */
   async function nextAttempt(
     nc: NatsConnection,
@@ -356,7 +514,9 @@ export function createWorker({
       if (parsed.ok && parsed.envelope.type === 'status') {
         const { state, attempt } = parsed.envelope
         if (state === 'queued') return 1
-        if (attempt !== undefined) return attempt + 1
+        if (attempt !== undefined) {
+          return state === 'released' ? attempt : attempt + 1
+        }
       }
       log(`status of ${taskId} has no usable attempt`)
     } catch (err) {
@@ -371,7 +531,29 @@ export function createWorker({
     msg: JsMsg,
   ): Promise<void> {
     const attempt = await nextAttempt(nc, task.task_id, msg)
-    if (stopping.signal.aborted) return
+    // Unacked, not naked: this may be a stale handle on a task another session
+    // holds. The latch can land here while the lookup of a lost task ran.
+    if (stopping.signal.aborted || released !== undefined) return
+    // Plan 3.3 steps 4 and 5. Either result carries the attempt it refused.
+    const expired = Date.now() - msg.time.getTime() > task.queue_ttl_s * 1000
+    if (expired || attempt > task.max_attempts) {
+      const reason = expired ? 'expired_in_queue' : 'attempts_exhausted'
+      const summary = expired
+        ? `not started within queue_ttl_s (${task.queue_ttl_s})`
+        : `not finished in max_attempts (${task.max_attempts})`
+      const stored = await storeFailure(
+        nc,
+        msg,
+        task.task_id,
+        attempt,
+        reason,
+        summary,
+      )
+      if (stored === undefined) return
+      recordFinished(nc, { task, attempt })
+      msg.term(reason)
+      return
+    }
     const meta = buildMeta({
       kind: 'task',
       task_id: task.task_id,
@@ -388,7 +570,7 @@ export function createWorker({
       onStream(STATE_STREAM_NAME, () => jetstream(nc).publish(subject, record)),
     )
     if (stopping.signal.aborted) return
-    const held = hold(task, msg, attempt)
+    const held = hold(nc, task, msg, attempt)
     try {
       await push(content, meta)
     } catch (err) {
@@ -462,7 +644,7 @@ export function createWorker({
       .jetstream()
       .consumers.get(TASKS_STREAM_NAME, durable)
     messages = await consumer.consume({ abort_on_missing_resource: true })
-    if (stopping.signal.aborted) messages.stop()
+    if (stopping.signal.aborted || released !== undefined) messages.stop()
     for await (const msg of messages) {
       onMessage()
       try {
@@ -479,6 +661,10 @@ export function createWorker({
     await sleep(timers.startupGrace)
     let restartIn = timers.restartMin
     while (!stopping.signal.aborted) {
+      if (released !== undefined) {
+        await sleep(timers.connectPoll)
+        continue
+      }
       const { nc } = connection
       if (!nc) {
         if (connection.unavailable) return
@@ -538,7 +724,8 @@ export function createWorker({
     held.finishing = true
     let stored: boolean
     try {
-      stored = await storeResult(nc, held.task.task_id, encoded.bytes)
+      const found = await storeResult(nc, held.task.task_id, encoded.bytes)
+      stored = found === 'written' || found === 'own_finish'
     } catch (err) {
       held.finishing = false
       const why = isNoResponders(err) ? bootstrapHint() : describeError(err)
@@ -569,10 +756,17 @@ export function createWorker({
 
     async stop() {
       stopping.abort()
+      // Pulling stops first, or the nak hands the task straight back here.
       messages?.stop()
+      // Not after the loop, which a stuck broker can hold past the deadline. No
+      // delivery can start holding from here: it rechecks the signal first.
+      const held = inFlight
+      if (held) {
+        release(held)
+        // A result on its way settles the task, redelivered or not.
+        if (!held.finishing) handBack(held.msg)
+      }
       await loop
-      // After the loop, so a delivery it was finishing cannot outlive this.
-      if (inFlight) release(inFlight)
     },
 
     async callTool(name, args) {
@@ -585,12 +779,19 @@ export function createWorker({
           unavailable ? `NATS unavailable: ${unavailable}` : 'NATS unavailable',
         )
       }
+      const settled = closed.get(args?.task_id)
+      if (settled) return settled
+      if (released !== undefined && released === args?.task_id) {
+        released = undefined
+        return toolError(RELEASED)
+      }
       const held = inFlight
       if (!held || held.task.task_id !== args?.task_id) {
         return missingStreams.size > 0
           ? toolError(bootstrapHint())
           : NOT_IN_FLIGHT
       }
+      accept(nc, held)
       try {
         return name === 'update_task'
           ? updateTask(nc, held, args)

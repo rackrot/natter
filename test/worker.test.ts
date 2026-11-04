@@ -82,7 +82,7 @@ const startWorkerSession = async (
 }
 
 // Each test gets its own worker, so its queue and durable are its own.
-const freshName = () => `w-${nuid.next().toLowerCase()}`
+const freshName = () => `w-${crypto.randomUUID()}`
 
 const makeTask = (to: string, overrides: Partial<Task> = {}): Task => {
   const task_id = nuid.next()
@@ -620,7 +620,7 @@ test.each([
   'with %s the attempt ignores deliveries that reached no push',
   async (_kind, status, attempt) => {
     const name = freshName()
-    const task = await publishTask(makeTask(name))
+    const task = await publishTask(makeTask(name, { max_attempts: 4 }))
     if (status) await writeStatus(task, status)
     await inflateDeliveries(name, 3)
 
@@ -639,7 +639,7 @@ test.each([
 
 test('an unparsable status counts deliveries instead of starting over', async () => {
   const name = freshName()
-  const task = await publishTask(makeTask(name))
+  const task = await publishTask(makeTask(name, { max_attempts: 4 }))
   nc.publish(statusSubject(name, task.task_id), 'not a status')
   await until(async () => {
     const msg = await jsm.direct.getMessage('NATTER_STATE', {
@@ -707,7 +707,7 @@ test('with status capture broken nothing is pushed, however many sessions are lo
 test('an unreadable status falls back to the delivery count and still pushes', async () => {
   await onFreshServer(async (server, js, manager) => {
     const name = freshName()
-    const task = makeTask(name)
+    const task = makeTask(name, { max_attempts: 4 })
     await js.publish(taskSubject(name), JSON.stringify(task))
     await setAllowDirect(manager, 'NATTER_STATE', false)
     await inflateDeliveries(name, 3, js)

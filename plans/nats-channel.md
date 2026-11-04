@@ -69,7 +69,7 @@ Reserved session names, because a name also selects the seed file: `admin` for e
 | description | `description` in `.claude/natter.json`, at most 512 bytes. Shown to the orchestrator |
 | NATS URL, creds dir, CA file | `NATTER_URL`, `NATTER_CREDS_DIR`, `NATTER_CA_FILE` env, then `userConfig` |
 
-`.mcp.json` maps `userConfig` to `NATTER_UC_URL`, `NATTER_UC_CREDS_DIR` and `NATTER_UC_CA_FILE`. The names differ on purpose: `.mcp.json` `env` overwrites inherited env, so sharing a name would make the shell override impossible.
+The `mcpServers` entry in `plugin.json` maps `userConfig` to `NATTER_UC_URL`, `NATTER_UC_CREDS_DIR` and `NATTER_UC_CA_FILE`. The names differ on purpose: that entry's `env` overwrites inherited env, so sharing a name would make the shell override impossible.
 
 **Role is env-only because activation must travel with the dev flag.** A plugin enabled in a repo starts its MCP server in every session there, including sessions without the flag, and those drop pushes silently. So a committed file must not be able to turn a plain `claude` session into a worker that pulls tasks. Launch is:
 
@@ -164,24 +164,30 @@ Worker consumer `task-<name>`: pull, explicit ack, filter `natter.task.<name>`, 
 2. Validate. On failure publish `failed`/`invalid_task` where possible and `term()`.
 3. Direct-get `natter.result.<me>.<task_id>`. If it exists, `ack()` and stop. This closes the crash window between result publish and ack.
 4. If `now - stream timestamp > queue_ttl_s`, publish `failed`/`expired_in_queue` and `term()`.
-5. Direct-get the latest `natter.status.<me>.<task_id>`. `attempt` is 1 if there is none or it is `queued`, otherwise its `attempt + 1`. A status with no `attempt`, one that fails to parse, or a failed read uses `deliveryCount`. If `attempt > max_attempts`, publish `failed`/`attempts_exhausted` and `term()`.
-6. Publish status `delivered` with `js.publish` and wait for the PubAck. If that fails, keep retrying with backoff under `working()` and do not push. Then push to Claude with `attempt` and start timers: `working()` every 30s, accept timer, run timer.
-7. `update_task` is the delivery receipt. The first call moves the task to `accepted` and stops the accept timer.
+5. Direct-get the latest `natter.status.<me>.<task_id>`. `attempt` is 1 if there is none or it is `queued`, its `attempt` if it is `released`, otherwise its `attempt + 1`. A status with no `attempt`, one that fails to parse, or a failed read uses `deliveryCount`. If `attempt > max_attempts`, publish `failed`/`attempts_exhausted` and `term()`.
+6. Publish status `delivered` with `js.publish` and wait for the PubAck. If that fails, keep retrying with backoff under `working()` and do not push. Then push to Claude with `attempt` and start timers: `working()` every 30s and the accept timer.
+7. `update_task` is the delivery receipt. The first call moves the task to `accepted`, stops the accept timer and starts the run timer. A `finish_task` that arrives first, even a rejected one, does the same with the timers but writes no status.
 8. `finish_task` publishes the result with `lastSubjectSequence: 0` and `Nats-Msg-Id = task_id`, waits for the PubAck, publishes status `finished`, then `ackAck()`, then pulls the next task. On error 10071, direct-get the stored result and compare its `instance`. Equal means this session's own retry after a lost PubAck, so continue as success. Different means another session won, so return "already recorded". The `Nats-Msg-Id` header cannot tell these apart, because it is the `task_id` for every session. A 10077 or a full stream returns `isError` and keeps the task.
+
+**Terminal results the plugin writes.** `attempts_exhausted`, `expired_in_queue` and `timeout` are stored first, then status `finished` is core-published, then `term()`. If the store fails, the task stays held under `working()` and the store retries; there is no `term()` without a result, and a stop during the retry leaves the task to return after `ack_wait`. The row is a hint only: `invalid_task` writes none because the title may be missing, and core publishes can be lost. So S6 and S7 must join on results and treat a stored result as terminal, whatever the row says.
 
 **No delivery ack from Claude.** `update_task` stands in for it. If it does not arrive within `accept_timeout_s` (600), then either the session is deaf (no channel loaded) or it is too busy, and the server:
 
 - publishes status `released`, before the `nak()`, so it cannot overwrite the next session's `delivered`,
 - calls `nak()` so another session can have the task,
-- latches: stops pulling and sets presence to `stalled`.
+- latches: stops pulling. S7 reports the latch as presence `stalled`.
 
 A later `update_task` or `finish_task` for a released task returns `isError` ("released, it will be redelivered"), clears the latch and resumes pulling. An unaccepted task has caused no side effects that the plugin knows of, so releasing is safe. A task seen twice is handled by the instruction "ignore a `task_id` you are already working on".
 
-**Run timeout.** On `timeout_s` after an accepted task, the server publishes `failed`/`timeout`, calls `term()`, and pushes `kind="task_closed"` so Claude stops. A later `finish_task` returns "already closed".
+**Run timeout.** On `timeout_s` after an accepted task, the server stores `failed`/`timeout`, calls `term()`, and pushes `kind="task_closed"` so Claude stops. From then on `finish_task` returns "already closed", or "already recorded" if another session's result was found. If the store finds this session's own `finish_task` result, whose PubAck was lost, nothing timed out: the task is acked, nothing is pushed, and the retry returns success.
 
-**Session exit.** On stdin close or a signal the server calls `nak()` on the in-flight task, publishes presence `offline`, drains, and exits within 2s. A crash or SIGKILL has no clean-up; the task returns after `ack_wait`.
+**Session exit.** On stdin close or a signal the server calls `nak()` on the in-flight task, drains, and exits within 2s. S7 adds presence `offline` before the drain. A crash or SIGKILL has no clean-up; the task returns after `ack_wait`.
 
-**Redelivery and side effects.** Attempts count pushes to Claude, not JetStream deliveries, and the stored `delivered` status published before each push is what records one, so nothing is pushed unless that record is stored. A delivery that reaches no push (a lost result lookup, a standby taking over, a broker outage) costs no attempt. When the status cannot give an attempt, `deliveryCount` stands in: it can overcount, but it keeps `max_attempts` a real bound. Known and accepted: a zombie session's `update_task` can overwrite the counter with its older attempt and undercount by one, bounded by the run timeout. A new session seeing `attempt > 1` is told to inspect repo state first, because the previous attempt may have changed things. `max_attempts: 1` means no retry after a lost session; it fails with `attempts_exhausted`.
+**Redelivery and side effects.** Attempts count pushes to Claude, not JetStream deliveries, and the stored `delivered` status published before each push is what records one, so nothing is pushed unless that record is stored. A delivery that reaches no record (a lost result lookup, a standby taking over, a broker outage) costs no attempt. A stop or failed push between the `delivered` store and the push does cost one, which is the safe direction.
+
+A release of an unaccepted task costs no attempt: the next delivery reuses the `attempt` of a `released` status, so deaf sessions cannot exhaust a task nobody worked on. The bound on a permanently deaf worker is then `queue_ttl_s` (`expired_in_queue`) plus the attention sweep on `released`. TTL fires at the next delivery, so a task nobody pulls can outlive it, up to stream `max_age`, when the broker deletes it with no result. `list_tasks` and `get_result` must report an open row whose task is gone from `NATTER_TASKS` as lost, not as still queued. `released` is a core publish, so a lost one overcounts by one, the safe direction. A clean exit before acceptance writes no `released`, so it still costs an attempt.
+
+When the status cannot give an attempt, `deliveryCount` stands in: it can overcount, but it keeps `max_attempts` a real bound. Known and accepted: a zombie session can overwrite the counter with its older attempt. Its `update_task` undercounts by one, bounded by the run timeout. Its accept timer's `released` write undercounts by two, because a `released` attempt is reused, and it fires at most once per push; the `nak` that follows can also move the task from the session holding it, which step 1 and first-result-wins absorb. A new session seeing `attempt > 1` is told to inspect repo state first, because the previous attempt may have changed things; a released task keeps its attempt and so carries no such hint, because nothing accepted it. `max_attempts: 1` means no retry after a lost session; it fails with `attempts_exhausted`.
 
 **Dedupe**, all three layers verified:
 
@@ -262,11 +268,11 @@ Each worker core-publishes `natter.presence.<name>` every 15s and on every state
 
 Heartbeats prove the server process lives, not that Claude is responsive. `update_task`, accept release and the run timeout cover that gap.
 
-**Attention sweep.** Every 30s the orchestrator reads open tasks from `NATTER_STATE`, and pushes one `kind="attention"` per task and condition:
+**Attention sweep.** Every 30s the orchestrator reads open tasks from `NATTER_STATE`, drops any with a stored result (3.3), and pushes one `kind="attention"` per task and condition:
 
 - status `delivered` or `accepted`, and the worker's presence is stale;
 - status `released`;
-- open past `created_at + queue_ttl_s + timeout_s + 300`.
+- open past `created_at + queue_ttl_s + accept_timeout_s + timeout_s + 300`.
 
 This covers a worker machine that dies for good, the one case no worker timer can report. It writes no results: Claude decides what to do. The one-per-condition memory is per process, so a restart may repeat a push.
 
@@ -322,7 +328,7 @@ Rejected: nkey signatures on each envelope (protects against a compromised broke
 
 Rejected: a dedupe on identical `(to, prompt)`: legitimate retries look the same, and the rate limit already bounds the damage.
 
-**Config defaults**, as named constants in `src/config.ts`. `timeout_s` and `max_attempts` can be set per task; `NATTER_ACCEPT_TIMEOUT_S` by env for tests. Tests need short timers, so all of them are overridable through env with a `NATTER_TEST_` prefix.
+**Config defaults**, as named constants in `src/config.ts`. `timeout_s` and `max_attempts` can be set per task. Tests need short timers, so all of them are overridable through `NATTER_TEST_*_MS` env, `NATTER_TEST_ACCEPT_TIMEOUT_MS` for the accept timeout.
 
 | Constant | Default |
 | --- | --- |
@@ -346,7 +352,7 @@ Rejected: a dedupe on identical `(to, prompt)`: legitimate retries look the same
 | Disconnect with task in flight | Timers keep going. On reconnect the task is redelivered and step 1 swaps the handle. No re-push |
 | `finish_task` while disconnected | `isError`, task stays in flight, Claude retries. Result stays in the tool call until stored |
 | Consume iterator ends | Outer loop restarts it with 1s to 15s backoff |
-| Claude session ends | stdin close or signal: `nak`, `offline`, drain, exit in 2s. A 5s poll backs this up, as telegram does. Unhandled rejections are logged, not fatal |
+| Claude session ends | stdin close or signal: `nak`, drain, exit in 2s; S7 adds `offline` before the drain. A 5s poll backs this up, as telegram does. Unhandled rejections are logged, not fatal |
 
 Logs go to stderr, prefixed `nats-channel:`. Nothing else may write to stdout.
 
@@ -374,7 +380,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 ### S1. Config, identity, connection lifecycle
 
-- Files: `src/config.ts`, `src/connection.ts`, `src/server.ts`, `.mcp.json`, `.claude-plugin/plugin.json` (`channels[0].userConfig`: `nats_url`, `creds_dir`, `ca_file`, each with a default so substitution never fails), `test/support/*`, `test/config.test.ts`, `test/lifecycle.test.ts`, refactor `test/nats.test.ts`.
+- Files: `src/config.ts`, `src/connection.ts`, `src/server.ts`, `.claude-plugin/plugin.json` (`channels[0].userConfig`: `nats_url`, `creds_dir`, `ca_file`, each with a default so substitution never fails), `test/support/*`, `test/config.test.ts`, `test/lifecycle.test.ts`, refactor `test/nats.test.ts`.
 - Depends on: nothing.
 - Acceptance: no `NATTER_ROLE` means no NATS connection and zero tools (existing `server.test.ts` passes unchanged); name precedence env, file, basename; invalid names rejected, inert with a stderr reason; missing `CLAUDE_PROJECT_DIR` with no `NATTER_NAME` is inert; MCP handshake completes with NATS down, and the connection comes up once NATS starts; closing stdin exits the process within 3s with NATS connected; non-loopback plaintext is refused.
 - Cheapest check: `bun test test/config.test.ts test/lifecycle.test.ts`, then `mise run validate`.
@@ -408,9 +414,9 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 ### S5. Worker durability
 
-- Files: `src/worker.ts`, `test/worker-durability.test.ts`.
+- Files: `src/worker.ts`, `src/config.ts` (timer constants), `test/worker-durability.test.ts`.
 - Depends on: S4.
-- Acceptance, with short timers: SIGKILL mid-task means the next session gets `attempt=2`; clean stdin close means prompt redelivery without waiting for `ack_wait`; `max_attempts` exceeded gives `failed`/`attempts_exhausted` and an empty queue; existing result on redelivery means ack with no push; broker restart mid-task means no second push, and `finish_task` still works; no `update_task` within the accept timeout means status `released`, presence `stalled`, no more pulls, redelivery to another session; a late tool call clears the latch; run timeout gives `failed`/`timeout`, `task_closed` pushed, later `finish_task` is an error; queue TTL expiry gives `expired_in_queue`; two sessions finishing one task leave one result and the loser gets "already recorded"; a retry by the session that won, after a lost PubAck, is a success, not "already recorded".
+- Acceptance, with short timers: SIGKILL mid-task means the next session gets `attempt=2`; clean stdin close means prompt redelivery without waiting for `ack_wait`; `max_attempts` exceeded gives `failed`/`attempts_exhausted` and an empty queue; existing result on redelivery means ack with no push; broker restart mid-task means no second push, and `finish_task` still works; no `update_task` within the accept timeout means status `released`, no more pulls, redelivery to another session at the same attempt; a late tool call clears the latch; repeated deaf releases keep the attempt and end at queue TTL expiry; run timeout gives `failed`/`timeout`, `task_closed` pushed, later `finish_task` is an error; queue TTL expiry gives `expired_in_queue`; two sessions finishing one task leave one result and the loser gets "already recorded"; a retry by the session that won, after a lost PubAck, is a success, not "already recorded".
 - Cheapest check: `bun test test/worker-durability.test.ts`.
 - Worker: high-complexity.
 
@@ -418,7 +424,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `src/orchestrator.ts`, `src/instructions.ts`, `src/server.ts`, `test/orchestrator.test.ts`, `test/e2e.test.ts`.
 - Depends on: S2, S3. S4 for the end-to-end test.
-- Acceptance: `send_task` publishes the `queued` status before the task and never rewrites it, because a `queued` status means attempt 1 to a worker; a retried publish does not duplicate; full queue returns `isError`; a result is pushed once with summary and `data_bytes`, `get_result` returns `data` and `artifacts`; a result stored while the orchestrator is down is pushed on the next start; `list_tasks` shows open and finished tasks after a restart; a result failing validation is dropped and logged; two real server processes, one per role, complete a task end to end.
+- Acceptance: a task the broker deleted at `max_age` shows as lost in `list_tasks` and `get_result`; `send_task` publishes the `queued` status before the task and never rewrites it, because a `queued` status means attempt 1 to a worker; a retried publish does not duplicate; full queue returns `isError`; a result is pushed once with summary and `data_bytes`, `get_result` returns `data` and `artifacts`; a result stored while the orchestrator is down is pushed on the next start; `list_tasks` shows open and finished tasks after a restart, and a task with a stored result as finished whatever its status row says; a result failing validation is dropped and logged; two real server processes, one per role, complete a task end to end.
 - Cheapest check: `bun test test/orchestrator.test.ts test/e2e.test.ts`.
 - Worker: design judgment.
 
@@ -426,7 +432,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `src/presence.ts`, `src/worker.ts`, `src/orchestrator.ts`, `test/presence.test.ts`.
 - Depends on: S5, S6.
-- Acceptance: `list_workers` shows a live worker; killed worker becomes `stale`; clean exit shows `offline`; busy worker shows `task_id`; `send_task` to a never-seen name returns `isError`, to an offline but known worker succeeds and reports the state; stale worker with an open task produces one `attention` push; `released` and overdue each produce one push.
+- Acceptance: `list_workers` shows a live worker; killed worker becomes `stale`; clean exit shows `offline`; an accept release shows `stalled` until a late tool call clears the latch; busy worker shows `task_id`; `send_task` to a never-seen name returns `isError`, to an offline but known worker succeeds and reports the state; stale worker with an open task produces one `attention` push; `released` and overdue each produce one push; a task with a stored result produces none, whatever its status row says.
 - Cheapest check: `bun test test/presence.test.ts`.
 - Worker: design judgment.
 

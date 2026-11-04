@@ -12,6 +12,8 @@ export interface TestNats {
   start(): Promise<void>
   stop(): Promise<void>
   restart(): Promise<void>
+  /** Signals only the server process this helper started. */
+  signal(sig: NodeJS.Signals): void
   /** Brings a server killed under a test back, on the same port and store. */
   revive(): Promise<void>
   /** Stops the server and removes the store directory. */
@@ -130,6 +132,9 @@ export async function startNats(
     },
     start,
     stop,
+    signal: (sig) => {
+      proc?.kill(sig)
+    },
     restart: async () => {
       await stop()
       await start()

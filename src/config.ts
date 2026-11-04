@@ -12,6 +12,7 @@ const ADMIN_NAME = 'admin'
 export const SHUTDOWN_DEADLINE_MS = 2000
 const ACK_WAIT_MS = 120_000
 const WORKING_MS = 30_000
+const ACCEPT_TIMEOUT_MS = 600_000
 const STARTUP_GRACE_MS = 5000
 const STREAM_RETRY_MS = 10_000
 const CONNECT_POLL_MS = 100
@@ -160,6 +161,7 @@ export function resolveTimers(env: Env) {
   return {
     ackWait: ms('ACK_WAIT', ACK_WAIT_MS),
     working: ms('WORKING', WORKING_MS),
+    acceptTimeout: ms('ACCEPT_TIMEOUT', ACCEPT_TIMEOUT_MS),
     startupGrace: ms('STARTUP_GRACE', STARTUP_GRACE_MS),
     streamRetry: ms('STREAM_RETRY', STREAM_RETRY_MS),
     connectPoll: ms('CONNECT_POLL', CONNECT_POLL_MS),
