@@ -7,6 +7,7 @@ export const MAX_DESCRIPTION_BYTES = 512
 export const MAX_TIMEOUT_S = 86400
 export const DEFAULT_NATS_URL = 'nats://127.0.0.1:4222'
 export const DEFAULT_CREDS_DIR = '~/.config/natter'
+const ADMIN_NAME = 'admin'
 // Shutdown must finish well inside the 3s the plugin promises on stdin close.
 export const SHUTDOWN_DEADLINE_MS = 2000
 
@@ -29,6 +30,11 @@ type Env = Record<string, string | undefined>
 // Empty counts as unset: unset `userConfig` values substitute as ''.
 const get = (env: Env, key: string) => env[key] || undefined
 
+// A name picks the seed file, so a session must not resolve to an identity
+// above its role. Bootstrap reaches `admin` through adminConfig instead.
+const isReserved = (role: Role, name: string) =>
+  name === ADMIN_NAME || (role === 'worker' && name === 'orchestrator')
+
 function sanitizeName(raw: string): string {
   return raw
     .toLowerCase()
@@ -41,6 +47,22 @@ function expandHome(path: string): string {
   return path === '~' || path.startsWith('~/')
     ? join(homedir(), path.slice(1))
     : path
+}
+
+function connectionSettings(env: Env, name: string) {
+  const credsDir = expandHome(
+    get(env, 'NATTER_CREDS_DIR') ??
+      get(env, 'NATTER_UC_CREDS_DIR') ??
+      DEFAULT_CREDS_DIR,
+  )
+  return {
+    url:
+      get(env, 'NATTER_URL') ?? get(env, 'NATTER_UC_URL') ?? DEFAULT_NATS_URL,
+    // Callers pass a validated name, so it cannot steer this path elsewhere.
+    seedPath: join(credsDir, `${name}.nk`),
+    caFile: get(env, 'NATTER_CA_FILE') ?? get(env, 'NATTER_UC_CA_FILE'),
+    allowPlaintext: get(env, 'NATTER_ALLOW_PLAINTEXT') === '1',
+  }
 }
 
 /**
@@ -88,6 +110,11 @@ export function resolveConfig(env: Env): Resolved {
   if (!NAME_PATTERN.test(name)) {
     return { inert: `name ${JSON.stringify(name)} must match ${NAME_PATTERN}` }
   }
+  if (isReserved(role, name)) {
+    return {
+      inert: `name ${JSON.stringify(name)} is reserved, not for a ${role}`,
+    }
+  }
 
   const description = file.description ?? ''
   if (
@@ -99,23 +126,21 @@ export function resolveConfig(env: Env): Resolved {
     }
   }
 
-  const credsDir = expandHome(
-    get(env, 'NATTER_CREDS_DIR') ??
-      get(env, 'NATTER_UC_CREDS_DIR') ??
-      DEFAULT_CREDS_DIR,
-  )
   return {
-    config: {
-      role,
-      name,
-      description,
-      url:
-        get(env, 'NATTER_URL') ?? get(env, 'NATTER_UC_URL') ?? DEFAULT_NATS_URL,
-      // The name was validated above, so it cannot steer this path elsewhere.
-      seedPath: join(credsDir, `${name}.nk`),
-      caFile: get(env, 'NATTER_CA_FILE') ?? get(env, 'NATTER_UC_CA_FILE'),
-      allowPlaintext: get(env, 'NATTER_ALLOW_PLAINTEXT') === '1',
-    },
+    config: { role, name, description, ...connectionSettings(env, name) },
+  }
+}
+
+/**
+ * The admin identity (plan 3.6), for bootstrap only: seed at
+ * `<creds dir>/admin.nk`, regardless of any session name in the environment.
+ */
+export function adminConfig(env: Env): Config {
+  return {
+    role: 'orchestrator',
+    name: ADMIN_NAME,
+    description: '',
+    ...connectionSettings(env, ADMIN_NAME),
   }
 }
 

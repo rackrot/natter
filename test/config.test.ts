@@ -2,7 +2,12 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { type Config, resolveConfig, resolveTransport } from '../src/config'
+import {
+  adminConfig,
+  type Config,
+  resolveConfig,
+  resolveTransport,
+} from '../src/config'
 import { startConnection } from '../src/connection'
 import { startSession } from './support/session'
 
@@ -90,6 +95,76 @@ describe('name precedence', () => {
     const dir = await project('described', { description: 'does things' })
     const r = resolveConfig({ NATTER_ROLE: 'worker', CLAUDE_PROJECT_DIR: dir })
     expect(r).toHaveProperty('config.description', 'does things')
+  })
+})
+
+describe('reserved names', () => {
+  const roles = ['worker', 'orchestrator'] as const
+
+  test.each(roles)(
+    'admin is inert for a %s, from env or file',
+    async (role) => {
+      const dir = await project('names-file', { name: 'admin' })
+      const fromEnv = { NATTER_ROLE: role, NATTER_NAME: 'admin' }
+      const fromFile = { NATTER_ROLE: role, CLAUDE_PROJECT_DIR: dir }
+      expect(resolveConfig(fromEnv)).toHaveProperty('inert')
+      expect(resolveConfig(fromFile)).toHaveProperty('inert')
+    },
+  )
+
+  test.each(['Admin', 'ADMIN', '.admin', '_Admin'])(
+    'a repo directory named %p cannot sanitize into admin',
+    async (dir) => {
+      const path = await project(join('names-dir', dir))
+      for (const role of roles) {
+        const r = resolveConfig({
+          NATTER_ROLE: role,
+          CLAUDE_PROJECT_DIR: path,
+        })
+        expect(r).toHaveProperty('inert')
+      }
+    },
+  )
+
+  test('orchestrator is inert for a worker by every route', async () => {
+    const file = await project('names-orch', { name: 'orchestrator' })
+    const basename = await project(join('names-orch', 'Orchestrator'))
+    const routes = [
+      { NATTER_NAME: 'orchestrator' },
+      { CLAUDE_PROJECT_DIR: file },
+      { CLAUDE_PROJECT_DIR: basename },
+    ]
+    for (const route of routes) {
+      const r = resolveConfig({ NATTER_ROLE: 'worker', ...route })
+      expect(r).toHaveProperty('inert')
+    }
+  })
+
+  test('the orchestrator keeps its own name', () => {
+    const r = resolveConfig({
+      NATTER_ROLE: 'orchestrator',
+      NATTER_NAME: 'orchestrator',
+      NATTER_CREDS_DIR: '/creds',
+    })
+    expect(r).toHaveProperty('config.seedPath', '/creds/orchestrator.nk')
+  })
+
+  test('bootstrap reaches the admin seed whatever session env is set', async () => {
+    const dir = await project('names-session', { name: 'from-file' })
+    const config = adminConfig({
+      NATTER_ROLE: 'worker',
+      NATTER_NAME: 'w',
+      CLAUDE_PROJECT_DIR: dir,
+      NATTER_CREDS_DIR: '/creds',
+      NATTER_URL: 'nats://env:1',
+      NATTER_CA_FILE: '/ca.pem',
+    })
+    expect(config).toMatchObject({
+      name: 'admin',
+      seedPath: '/creds/admin.nk',
+      url: 'nats://env:1',
+      caFile: '/ca.pem',
+    })
   })
 })
 

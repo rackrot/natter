@@ -27,6 +27,12 @@ const nuidToken = (value: string, what: string): string => {
 
 export const taskSubject = (worker: string) =>
   `natter.task.${nameToken(worker, 'worker')}`
+/** Wildcard forms of the four subjects, for stream capture and ACLs. */
+export const TASK_SUBJECTS = 'natter.task.*'
+export const RESULT_SUBJECTS = 'natter.result.*.*'
+export const STATUS_SUBJECTS = 'natter.status.*.*'
+export const PRESENCE_SUBJECTS = 'natter.presence.*'
+
 export const presenceSubject = (worker: string) =>
   `natter.presence.${nameToken(worker, 'worker')}`
 export const resultSubject = (worker: string, taskId: string) =>

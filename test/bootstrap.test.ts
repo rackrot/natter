@@ -1,0 +1,424 @@
+import { afterAll, beforeAll, expect, test } from 'bun:test'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  DiscardPolicy,
+  JetStreamApiCodes,
+  JetStreamApiError,
+  type JetStreamManager,
+  jetstream,
+  jetstreamManager,
+  RetentionPolicy,
+  StorageType,
+} from '@nats-io/jetstream'
+import {
+  connect,
+  type NatsConnection,
+  nanos,
+  nuid,
+} from '@nats-io/transport-node'
+import {
+  bootstrapStreams,
+  RESULTS_STREAM,
+  STATE_STREAM,
+  STREAMS,
+  TASKS_STREAM,
+} from '../src/bootstrap'
+import {
+  MAX_MESSAGE_BYTES,
+  presenceSubject,
+  resultSubject,
+  taskSubject,
+} from '../src/protocol'
+import { startNats, type TestNats, until } from './support/nats'
+
+// Maximum messages per subject reached; the client has no name for this code.
+const STREAM_STORE_FAILED = 10077
+const MIB = 1024 * 1024
+
+let nats: TestNats
+let nc: NatsConnection
+let jsm: JetStreamManager
+
+const connectTo = async (url: string) => {
+  const conn = await connect({ servers: url })
+  return { conn, manager: await jetstreamManager(conn) }
+}
+
+const configOf = async (name: string) => (await jsm.streams.info(name)).config
+
+/** The fields bootstrap owns, as stored by the server. */
+const managed = async (want: (typeof STREAMS)[number]) => {
+  const config = await configOf(want.name)
+  return Object.fromEntries(
+    Object.keys(want).map((k) => [
+      k,
+      config[k as keyof typeof config] ?? false,
+    ]),
+  )
+}
+
+/** The JetStream API error code a promise rejects with. */
+const apiCode = async (p: Promise<unknown>) => {
+  try {
+    await p
+  } catch (err) {
+    if (err instanceof JetStreamApiError) return err.code
+    throw err
+  }
+}
+
+const messagesIn = async (name: string) =>
+  (await jsm.streams.info(name)).state.messages
+
+const onFreshServer = async (
+  run: (
+    server: TestNats,
+    conn: NatsConnection,
+    manager: JetStreamManager,
+  ) => Promise<void>,
+) => {
+  const server = await startNats({ jetstream: true })
+  const { conn, manager } = await connectTo(server.url)
+  try {
+    await run(server, conn, manager)
+  } finally {
+    await conn.close()
+    await server.cleanup()
+  }
+}
+
+/** Runs the real command, so its identity and connection policy are in play. */
+const runBootstrap = async (url: string) => {
+  const proc = Bun.spawn(['bun', 'src/bootstrap.ts'], {
+    env: {
+      PATH: process.env.PATH ?? '',
+      NATTER_URL: url,
+      NATTER_CREDS_DIR: join(tmpdir(), 'natter-no-creds'),
+    },
+    stdout: 'pipe',
+    stderr: 'ignore',
+    // A hang must not outlive its test; a kill also exits other than 1.
+    timeout: 4000,
+  })
+  const [stdout, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    proc.exited,
+  ])
+  return { stdout, code }
+}
+
+const recordResult = async () => {
+  const taskId = nuid.next()
+  const subject = resultSubject('alpha', taskId)
+  const { seq } = await jetstream(nc).publish(subject, 'first', {
+    msgID: taskId,
+    expect: { lastSubjectSequence: 0 },
+  })
+  return { subject, seq }
+}
+
+const storedResult = async (subject: string) => {
+  const msg = await jsm.streams.getMessage('NATTER_RESULTS', {
+    last_by_subj: subject,
+  })
+  return { seq: msg?.seq, value: msg?.string() }
+}
+
+beforeAll(async () => {
+  nats = await startNats({ jetstream: true })
+  ;({ conn: nc, manager: jsm } = await connectTo(nats.url))
+})
+
+afterAll(async () => {
+  await nc?.close()
+  await nats?.cleanup()
+})
+
+test('creates the three streams with the plan settings', async () => {
+  const outcomes = await bootstrapStreams(jsm)
+  expect(outcomes.map((o) => [o.name, o.action])).toEqual([
+    ['NATTER_TASKS', 'created'],
+    ['NATTER_RESULTS', 'created'],
+    ['NATTER_STATE', 'created'],
+  ])
+
+  const day = 24 * 60 * 60 * 1000
+  const base = {
+    storage: 'file',
+    duplicate_window: nanos(2 * 60 * 1000),
+    max_msg_size: MAX_MESSAGE_BYTES,
+  }
+  expect(await managed(TASKS_STREAM)).toEqual({
+    ...base,
+    name: 'NATTER_TASKS',
+    subjects: ['natter.task.*'],
+    retention: 'workqueue',
+    max_age: nanos(7 * day),
+    max_msgs_per_subject: 16,
+    discard: 'new',
+    discard_new_per_subject: true,
+    allow_direct: false,
+    max_bytes: 256 * MIB,
+  })
+  expect(await managed(RESULTS_STREAM)).toEqual({
+    ...base,
+    name: 'NATTER_RESULTS',
+    subjects: ['natter.result.*.*'],
+    retention: 'limits',
+    max_age: nanos(14 * day),
+    max_msgs_per_subject: 1,
+    discard: 'new',
+    discard_new_per_subject: true,
+    allow_direct: true,
+    max_bytes: 1024 * MIB,
+  })
+  expect(await managed(STATE_STREAM)).toEqual({
+    ...base,
+    name: 'NATTER_STATE',
+    subjects: ['natter.status.*.*', 'natter.presence.*'],
+    retention: 'limits',
+    max_age: nanos(14 * day),
+    max_msgs_per_subject: 1,
+    discard: 'old',
+    discard_new_per_subject: false,
+    allow_direct: true,
+    max_bytes: 256 * MIB,
+  })
+})
+
+test('the stream definitions cannot be changed at runtime', () => {
+  for (const stream of STREAMS) {
+    expect(Object.isFrozen(stream)).toBe(true)
+    expect(Object.isFrozen(stream.subjects)).toBe(true)
+  }
+})
+
+test('a second run changes nothing and keeps stored messages', async () => {
+  const js = jetstream(nc)
+  await js.publish(taskSubject('alpha'), 'queued', { msgID: nuid.next() })
+  const before = await Promise.all(STREAMS.map((s) => configOf(s.name)))
+
+  const outcomes = await bootstrapStreams(jsm)
+
+  expect(outcomes.map((o) => o.action)).toEqual([
+    'unchanged',
+    'unchanged',
+    'unchanged',
+  ])
+  expect(await Promise.all(STREAMS.map((s) => configOf(s.name)))).toEqual(
+    before,
+  )
+  expect(await messagesIn('NATTER_TASKS')).toBe(1)
+})
+
+test('a drifted stream is updated back without losing messages', async () => {
+  const drifted = await configOf('NATTER_TASKS')
+  await jsm.streams.update('NATTER_TASKS', {
+    ...drifted,
+    subjects: [...drifted.subjects, 'natter.drift.*'],
+    max_age: nanos(60_000),
+    max_msgs_per_subject: 2,
+    max_msg_size: 1024,
+    max_bytes: 512 * MIB,
+    duplicate_window: nanos(30_000),
+  })
+  const resultsDrift = await configOf('NATTER_RESULTS')
+  await jsm.streams.update('NATTER_RESULTS', {
+    ...resultsDrift,
+    discard_new_per_subject: false,
+  })
+  const stateDrift = await configOf('NATTER_STATE')
+  await jsm.streams.update('NATTER_STATE', {
+    ...stateDrift,
+    allow_direct: false,
+    discard: DiscardPolicy.New,
+    discard_new_per_subject: true,
+  })
+  const held = await messagesIn('NATTER_TASKS')
+
+  const outcomes = await bootstrapStreams(jsm)
+
+  expect(
+    outcomes.map(({ name, action, changed, messages }) => [
+      name,
+      action,
+      [...changed].sort(),
+      messages?.before,
+      messages?.after,
+    ]),
+  ).toEqual([
+    [
+      'NATTER_TASKS',
+      'updated',
+      [
+        'duplicate_window',
+        'max_age',
+        'max_bytes',
+        'max_msg_size',
+        'max_msgs_per_subject',
+        'subjects',
+      ],
+      held,
+      held,
+    ],
+    ['NATTER_RESULTS', 'updated', ['discard_new_per_subject'], 0, 0],
+    [
+      'NATTER_STATE',
+      'updated',
+      ['allow_direct', 'discard', 'discard_new_per_subject'],
+      0,
+      0,
+    ],
+  ])
+  for (const stream of STREAMS) {
+    expect(await managed(stream)).toEqual({ ...stream })
+  }
+  expect(await messagesIn('NATTER_TASKS')).toBe(held)
+})
+
+test('a tightened limit shows what it trimmed', async () => {
+  await onFreshServer(async (server, conn, manager) => {
+    await manager.streams.add({ ...STATE_STREAM, max_msgs_per_subject: 5 })
+    const subject = presenceSubject('alpha')
+    for (let i = 0; i < 5; i++) await jetstream(conn).publish(subject, `p${i}`)
+
+    const { code, stdout } = await runBootstrap(server.url)
+
+    expect(code).toBe(0)
+    const state = await manager.streams.info('NATTER_STATE')
+    expect(state.config.max_msgs_per_subject).toBe(1)
+    expect(state.state.messages).toBe(1)
+    const line = stdout.split('\n').find((l) => l.includes('NATTER_STATE'))
+    expect(line).toMatch(/\b5\b.*\b1\b/)
+  })
+})
+
+// The stuck stream comes last in plan order, so only the check that runs
+// before any change can keep the first two untouched.
+test.each([
+  ['retention', { retention: RetentionPolicy.Workqueue }],
+  ['storage', { storage: StorageType.Memory }],
+])('a %s drift fails loudly and changes nothing', async (key, drift) => {
+  await onFreshServer(async (_server, conn, manager) => {
+    await manager.streams.add({ ...RESULTS_STREAM, max_msgs_per_subject: 5 })
+    await manager.streams.add({ ...STATE_STREAM, ...drift })
+    await jetstream(conn).publish(presenceSubject('alpha'), 'here')
+
+    await expect(bootstrapStreams(manager)).rejects.toThrow(
+      `NATTER_STATE.${key}`,
+    )
+
+    const state = await manager.streams.info('NATTER_STATE')
+    expect(state.config).toMatchObject(drift)
+    expect(state.state.messages).toBe(1)
+    const results = await manager.streams.info('NATTER_RESULTS')
+    expect(results.config.max_msgs_per_subject).toBe(5)
+    expect(await apiCode(manager.streams.info('NATTER_TASKS'))).toBe(
+      JetStreamApiCodes.StreamNotFound,
+    )
+  })
+})
+
+test('the command creates the streams as the admin identity', async () => {
+  await onFreshServer(async (server, _conn, manager) => {
+    const { code } = await runBootstrap(server.url)
+
+    expect(code).toBe(0)
+    for (const stream of STREAMS) {
+      expect((await manager.streams.info(stream.name)).config.name).toBe(
+        stream.name,
+      )
+    }
+  })
+})
+
+test('the command gives up at once when no server is listening', async () => {
+  const down = await startNats({ autostart: false })
+  try {
+    expect((await runBootstrap(down.url)).code).toBe(1)
+  } finally {
+    await down.cleanup()
+  }
+})
+
+test('tls:// against a plain server does not connect', async () => {
+  await onFreshServer(async (server, _conn, manager) => {
+    const dialsBefore = await server.totalConnections()
+
+    const { code } = await runBootstrap(server.url.replace('nats://', 'tls://'))
+
+    expect(code).toBe(1)
+    expect(await server.totalConnections()).toBeGreaterThan(dialsBefore)
+    expect(await apiCode(manager.streams.info('NATTER_TASKS'))).toBe(
+      JetStreamApiCodes.StreamNotFound,
+    )
+  })
+})
+
+test('the per-subject cap rejects the 17th queued task but not another worker', async () => {
+  const js = jetstream(nc)
+  const subject = taskSubject('capped')
+  for (let i = 0; i < 16; i++) await js.publish(subject, `t${i}`)
+  await expect(js.publish(subject, 't16')).rejects.toThrow()
+  expect((await js.publish(taskSubject('other'), 'ok')).stream).toBe(
+    'NATTER_TASKS',
+  )
+})
+
+test('Nats-Msg-Id dedupes a repeated publish', async () => {
+  const js = jetstream(nc)
+  const subject = taskSubject('dedupe')
+  const msgID = nuid.next()
+  const first = await js.publish(subject, 'x', { msgID })
+  const second = await js.publish(subject, 'x', { msgID })
+  expect(first.duplicate).toBe(false)
+  expect(second.duplicate).toBe(true)
+  expect(second.seq).toBe(first.seq)
+})
+
+test('a message over max_msg_size is rejected, one at the limit is stored', async () => {
+  const js = jetstream(nc)
+  const big = new Uint8Array(MAX_MESSAGE_BYTES + 1)
+  await expect(js.publish(taskSubject('big'), big)).rejects.toThrow()
+  await expect(
+    js.publish(resultSubject('big', nuid.next()), big),
+  ).rejects.toThrow()
+  await expect(js.publish(presenceSubject('big'), big)).rejects.toThrow()
+  const edge = new Uint8Array(MAX_MESSAGE_BYTES - 1024)
+  expect((await js.publish(taskSubject('big'), edge)).seq).toBeGreaterThan(0)
+})
+
+test('the first result for a task wins', async () => {
+  const { subject, seq } = await recordResult()
+
+  // A different msgID so the loss is the sequence check, not dedupe.
+  const loser = jetstream(nc).publish(subject, 'second', {
+    msgID: nuid.next(),
+    expect: { lastSubjectSequence: 0 },
+  })
+
+  expect(await apiCode(loser)).toBe(JetStreamApiCodes.StreamWrongLastSequence)
+  expect(await storedResult(subject)).toEqual({ seq, value: 'first' })
+})
+
+test('a plain JetStream publish cannot replace a recorded result', async () => {
+  const { subject, seq } = await recordResult()
+
+  const forged = jetstream(nc).publish(subject, 'forged')
+
+  expect(await apiCode(forged)).toBe(STREAM_STORE_FAILED)
+  expect(await storedResult(subject)).toEqual({ seq, value: 'first' })
+})
+
+test('a core publish cannot replace a recorded result', async () => {
+  const { subject, seq } = await recordResult()
+  const control = resultSubject('alpha', nuid.next())
+
+  nc.publish(subject, 'forged')
+  // Sent after it on one connection: once stored, the forgery was processed.
+  nc.publish(control, 'captured')
+  await until(async () => (await storedResult(control)).value === 'captured')
+
+  expect(await storedResult(subject)).toEqual({ seq, value: 'first' })
+})

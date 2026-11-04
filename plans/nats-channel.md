@@ -58,6 +58,8 @@ Spikes were run in `/tmp` against the repo's `node_modules`, Bun 1.4.4 and `nats
 
 `<worker>` matches `^[a-z0-9][a-z0-9_-]{0,63}$`. `<task_id>` is a nuid. The subject token is the identity: ACLs bind it to a credential, and a receiver drops any envelope whose `worker` or `to` disagrees with the subject.
 
+Reserved session names, because a name also selects the seed file: `admin` for every role, `orchestrator` for workers. Bootstrap gets its identity from `adminConfig` and never goes through session resolution.
+
 **Identity resolution**, done synchronously at startup because `instructions` and capabilities are fixed in the `Server` constructor:
 
 | Value | Source, first match wins |
@@ -149,9 +151,9 @@ Rejected: protobuf or msgpack (`nats sub` readability matters for the plain-subj
 
 | Message | Transport | Must survive | Retention |
 | --- | --- | --- | --- |
-| task | JetStream publish, `NATTER_TASKS` | worker offline, restart | workqueue, file, `max_age` 7d, `max_msgs_per_subject` 16, `discard: new`, `discard_new_per_subject`, `duplicate_window` 2m |
-| result | JetStream publish, `NATTER_RESULTS` | orchestrator offline, restart | limits, file, `max_age` 14d, `max_msgs_per_subject` 1, `allow_direct` |
-| status, presence | core publish into `NATTER_STATE` | nothing; losing one is fine | limits, file, `max_age` 14d, `max_msgs_per_subject` 1, `allow_direct` |
+| task | JetStream publish, `NATTER_TASKS` | worker offline, restart | workqueue, file, `max_age` 7d, `max_msgs_per_subject` 16, `max_bytes` 256 MiB, `discard: new`, `discard_new_per_subject`, `duplicate_window` 2m |
+| result | JetStream publish, `NATTER_RESULTS` | orchestrator offline, restart | limits, file, `max_age` 14d, `max_msgs_per_subject` 1, `max_bytes` 1 GiB, `discard: new`, `discard_new_per_subject`, `allow_direct` |
+| status, presence | core publish into `NATTER_STATE` | nothing; losing one is fine | limits, file, `max_age` 14d, `max_msgs_per_subject` 1, `max_bytes` 256 MiB, `max_msg_size` 128 KiB, `allow_direct` |
 
 Worker consumer `task-<name>`: pull, explicit ack, filter `natter.task.<name>`, `max_ack_pending` 1, `ack_wait` 120s, `max_deliver` unset. JetStream's limit is deliberately unused: a workqueue message that hits `max_deliver` stays in the stream and nobody hears about it. The plugin enforces attempts and always emits a terminal result.
 
@@ -164,7 +166,7 @@ Worker consumer `task-<name>`: pull, explicit ack, filter `natter.task.<name>`, 
 5. If `deliveryCount > max_attempts`, publish `failed`/`attempts_exhausted` and `term()`.
 6. Publish status `delivered`, push to Claude with `attempt`, start timers: `working()` every 30s, accept timer, run timer.
 7. `update_task` is the delivery receipt. The first call moves the task to `accepted` and stops the accept timer.
-8. `finish_task` publishes the result with `lastSubjectSequence: 0` and `Nats-Msg-Id = task_id`, waits for the PubAck, publishes status `finished`, then `ackAck()`, then pulls the next task.
+8. `finish_task` publishes the result with `lastSubjectSequence: 0` and `Nats-Msg-Id = task_id`, waits for the PubAck, publishes status `finished`, then `ackAck()`, then pulls the next task. On error 10071, direct-get the stored result and compare its `instance`. Equal means this session's own retry after a lost PubAck, so continue as success. Different means another session won, so return "already recorded". The `Nats-Msg-Id` header cannot tell these apart, because it is the `task_id` for every session. A 10077 or a full stream returns `isError` and keeps the task.
 
 **No delivery ack from Claude.** `update_task` stands in for it. If it does not arrive within `accept_timeout_s` (600), then either the session is deaf (no channel loaded) or it is too busy, and the server:
 
@@ -185,7 +187,7 @@ A later `update_task` or `finish_task` for a released task returns `isError` ("r
 | Duplicate source | Guard |
 | --- | --- |
 | orchestrator republishes after a lost PubAck | `Nats-Msg-Id` within 2m; `send_task` retries with the same `task_id` |
-| two sessions both finish a task (sleep, redelivery) | first result wins on `lastSubjectSequence: 0`; the loser's tool call returns "already recorded" |
+| two sessions both finish a task (sleep, redelivery) | first result wins, enforced by the stream (`discard: new` per subject) as well as `lastSubjectSequence: 0`; on 10071 compare `instance` as in step 8; a loser's tool call returns "already recorded" |
 | crash between result and ack | step 3 direct-get |
 
 **Orchestrator results.** Durable `results`, filter `natter.result.*.*`, `max_ack_pending` 8, ack after the notification is written to the transport. Results are never lost by this: the stream keeps them for 14d and `list_tasks` plus `get_result` read them. A fresh orchestrator session has no memory anyway, so its recovery path is those tools, not a redelivered push.
@@ -407,7 +409,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `src/worker.ts`, `test/worker-durability.test.ts`.
 - Depends on: S4.
-- Acceptance, with short timers: SIGKILL mid-task means the next session gets `attempt=2`; clean stdin close means prompt redelivery without waiting for `ack_wait`; `max_attempts` exceeded gives `failed`/`attempts_exhausted` and an empty queue; existing result on redelivery means ack with no push; broker restart mid-task means no second push, and `finish_task` still works; no `update_task` within the accept timeout means status `released`, presence `stalled`, no more pulls, redelivery to another session; a late tool call clears the latch; run timeout gives `failed`/`timeout`, `task_closed` pushed, later `finish_task` is an error; queue TTL expiry gives `expired_in_queue`; two sessions finishing one task leave one result and the loser gets "already recorded".
+- Acceptance, with short timers: SIGKILL mid-task means the next session gets `attempt=2`; clean stdin close means prompt redelivery without waiting for `ack_wait`; `max_attempts` exceeded gives `failed`/`attempts_exhausted` and an empty queue; existing result on redelivery means ack with no push; broker restart mid-task means no second push, and `finish_task` still works; no `update_task` within the accept timeout means status `released`, presence `stalled`, no more pulls, redelivery to another session; a late tool call clears the latch; run timeout gives `failed`/`timeout`, `task_closed` pushed, later `finish_task` is an error; queue TTL expiry gives `expired_in_queue`; two sessions finishing one task leave one result and the loser gets "already recorded"; a retry by the session that won, after a lost PubAck, is a success, not "already recorded".
 - Cheapest check: `bun test test/worker-durability.test.ts`.
 - Worker: high-complexity.
 
@@ -447,7 +449,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `README.md`, `src/instructions.ts`, `.claude-plugin/plugin.json` (version), `mise.toml` if needed.
 - Depends on: all.
-- Acceptance: README covers launch commands, `.claude/natter.json`, allow rules with exact tool names, orchestrator lockdown, bootstrap, auth setup, research-preview limits and tested Claude Code version; smoke checklist run once on two sessions, ideally across two machines over `tls://`; a planted result telling the orchestrator to change settings is not obeyed.
+- Acceptance: README covers bootstrap's 1.5 GiB JetStream storage need, launch commands, `.claude/natter.json`, allow rules with exact tool names, orchestrator lockdown, bootstrap, auth setup, research-preview limits and tested Claude Code version; smoke checklist run once on two sessions, ideally across two machines over `tls://`; a planted result telling the orchestrator to change settings is not obeyed.
 - Cheapest check: run the checklist; `mise run check`.
 - Worker: docs.
 

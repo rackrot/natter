@@ -12,6 +12,10 @@ run = "bun install"
 description = "Run a local JetStream-enabled nats-server"
 run = "nats-server -js -a 127.0.0.1 -sd .nats-data"
 
+[tasks.bootstrap]
+description = "Create or reconcile the NATTER_* JetStream streams (admin)"
+run = "bun src/bootstrap.ts"
+
 [tasks.lint]
 description = "Biome check and type check"
 run = ["biome check .", "bunx tsc --noEmit"]
