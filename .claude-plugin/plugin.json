@@ -1,0 +1,9 @@
+{
+  "name": "nats-channel",
+  "description": "Let your Claude Code sessions talk over NATS. Orchestrate repo-level agents with pub/sub, durable queues, and structured results.",
+  "version": "0.0.1",
+  "author": { "name": "rackrot" },
+  "license": "MIT",
+  "keywords": ["nats", "channel", "mcp", "pubsub", "orchestration"],
+  "channels": [{ "server": "nats-channel", "displayName": "NATS" }]
+}

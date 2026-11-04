@@ -1,0 +1,33 @@
+[tools]
+bun = "1.4.4"
+biome = "2.5.15"
+nats-server = "2.15.2"
+"aqua:nats-io/natscli" = "0.5.1"
+
+[tasks.setup]
+description = "Install dependencies"
+run = "bun install"
+
+[tasks.nats]
+description = "Run a local JetStream-enabled nats-server"
+run = "nats-server -js -a 127.0.0.1 -sd .nats-data"
+
+[tasks.lint]
+description = "Biome check and type check"
+run = ["biome check .", "bunx tsc --noEmit"]
+
+[tasks.fmt]
+description = "Format with Biome"
+run = "biome format --write ."
+
+[tasks.test]
+description = "Run tests"
+run = "bun test"
+
+[tasks.validate]
+description = "Validate the plugin and marketplace manifests"
+run = "claude plugin validate . --strict"
+
+[tasks.check]
+description = "Lint, test, and validate"
+depends = ["lint", "test", "validate"]

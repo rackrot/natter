@@ -1,0 +1,6 @@
+{
+  "name": "natter",
+  "description": "Claude Code plugins that connect sessions over NATS.",
+  "owner": { "name": "rackrot" },
+  "plugins": [{ "name": "nats-channel", "source": "./" }]
+}
