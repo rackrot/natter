@@ -1,9 +1,12 @@
-import { afterAll, beforeAll, expect, test } from 'bun:test'
+import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { startNats, type TestNats, until } from './support/nats'
 import { type Session, startSession } from './support/session'
+
+// A Bun test timeout kills tracked subprocesses, including a shared nats-server.
+setDefaultTimeout(15_000)
 
 const sessions: Session[] = []
 const nats: TestNats[] = []
@@ -51,7 +54,7 @@ test('handshake completes with NATS down, and the connection comes up once NATS 
   nats.push(down)
   const s = await worker(down.url, 'late')
 
-  expect((await s.client.listTools()).tools).toEqual([])
+  await s.client.ping()
   expect(await down.clientNames().catch(() => [])).toEqual([])
 
   await down.start()
@@ -78,7 +81,7 @@ test('an unreadable seed keeps the session up with no broker client', async () =
   const s = await worker(up.url, 'noread', { NATTER_CREDS_DIR: creds })
   await Bun.sleep(500)
 
-  expect((await s.client.listTools()).tools).toEqual([])
+  await s.client.ping()
   expect(s.errors).toEqual([])
   expect(await up.totalConnections()).toBe(before)
 })
@@ -91,7 +94,7 @@ test('tls:// is refused by a plain server the client can otherwise reach', async
   // Two accepted dials: the client reached the server, gave up, and retried.
   await until(async () => (await plain.totalConnections()) >= 2, 8000)
   expect(await plain.clientNames()).not.toContain('natter-needs-tls')
-  expect((await s.client.listTools()).tools).toEqual([])
+  await s.client.ping()
 
   await worker(plain.url, 'plaintext-control')
   await until(async () =>

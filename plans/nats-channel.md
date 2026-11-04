@@ -53,7 +53,7 @@ Spikes were run in `/tmp` against the repo's `node_modules`, Bun 1.4.4 and `nats
 | --- | --- | --- | --- |
 | `natter.task.<worker>` | orchestrator | `NATTER_TASKS` | queued tasks |
 | `natter.result.<worker>.<task_id>` | worker | `NATTER_RESULTS` | one terminal result per task |
-| `natter.status.<worker>.<task_id>` | both | `NATTER_STATE` (core publish, stream captures) | latest task state, the ledger |
+| `natter.status.<worker>.<task_id>` | both | `NATTER_STATE` (core publish, stream captures; `delivered` is a JetStream publish) | latest task state, the ledger |
 | `natter.presence.<worker>` | worker | `NATTER_STATE` (core publish, stream captures) | latest heartbeat |
 
 `<worker>` matches `^[a-z0-9][a-z0-9_-]{0,63}$`. `<task_id>` is a nuid. The subject token is the identity: ACLs bind it to a credential, and a receiver drops any envelope whose `worker` or `to` disagrees with the subject.
@@ -153,7 +153,8 @@ Rejected: protobuf or msgpack (`nats sub` readability matters for the plain-subj
 | --- | --- | --- | --- |
 | task | JetStream publish, `NATTER_TASKS` | worker offline, restart | workqueue, file, `max_age` 7d, `max_msgs_per_subject` 16, `max_bytes` 256 MiB, `discard: new`, `discard_new_per_subject`, `duplicate_window` 2m |
 | result | JetStream publish, `NATTER_RESULTS` | orchestrator offline, restart | limits, file, `max_age` 14d, `max_msgs_per_subject` 1, `max_bytes` 1 GiB, `discard: new`, `discard_new_per_subject`, `allow_direct` |
-| status, presence | core publish into `NATTER_STATE` | nothing; losing one is fine | limits, file, `max_age` 14d, `max_msgs_per_subject` 1, `max_bytes` 256 MiB, `max_msg_size` 128 KiB, `allow_direct` |
+| status `delivered` | JetStream publish, `NATTER_STATE` | session loss, because it is the attempt record: losing one lets `max_attempts` go unenforced | as the row below |
+| other status, presence | core publish into `NATTER_STATE` | nothing; losing one is fine | limits, file, `max_age` 14d, `max_msgs_per_subject` 1, `max_bytes` 256 MiB, `max_msg_size` 128 KiB, `allow_direct` |
 
 Worker consumer `task-<name>`: pull, explicit ack, filter `natter.task.<name>`, `max_ack_pending` 1, `ack_wait` 120s, `max_deliver` unset. JetStream's limit is deliberately unused: a workqueue message that hits `max_deliver` stays in the stream and nobody hears about it. The plugin enforces attempts and always emits a terminal result.
 
@@ -163,15 +164,15 @@ Worker consumer `task-<name>`: pull, explicit ack, filter `natter.task.<name>`, 
 2. Validate. On failure publish `failed`/`invalid_task` where possible and `term()`.
 3. Direct-get `natter.result.<me>.<task_id>`. If it exists, `ack()` and stop. This closes the crash window between result publish and ack.
 4. If `now - stream timestamp > queue_ttl_s`, publish `failed`/`expired_in_queue` and `term()`.
-5. If `deliveryCount > max_attempts`, publish `failed`/`attempts_exhausted` and `term()`.
-6. Publish status `delivered`, push to Claude with `attempt`, start timers: `working()` every 30s, accept timer, run timer.
+5. Direct-get the latest `natter.status.<me>.<task_id>`. `attempt` is 1 if there is none or it is `queued`, otherwise its `attempt + 1`. A status with no `attempt`, one that fails to parse, or a failed read uses `deliveryCount`. If `attempt > max_attempts`, publish `failed`/`attempts_exhausted` and `term()`.
+6. Publish status `delivered` with `js.publish` and wait for the PubAck. If that fails, keep retrying with backoff under `working()` and do not push. Then push to Claude with `attempt` and start timers: `working()` every 30s, accept timer, run timer.
 7. `update_task` is the delivery receipt. The first call moves the task to `accepted` and stops the accept timer.
 8. `finish_task` publishes the result with `lastSubjectSequence: 0` and `Nats-Msg-Id = task_id`, waits for the PubAck, publishes status `finished`, then `ackAck()`, then pulls the next task. On error 10071, direct-get the stored result and compare its `instance`. Equal means this session's own retry after a lost PubAck, so continue as success. Different means another session won, so return "already recorded". The `Nats-Msg-Id` header cannot tell these apart, because it is the `task_id` for every session. A 10077 or a full stream returns `isError` and keeps the task.
 
 **No delivery ack from Claude.** `update_task` stands in for it. If it does not arrive within `accept_timeout_s` (600), then either the session is deaf (no channel loaded) or it is too busy, and the server:
 
+- publishes status `released`, before the `nak()`, so it cannot overwrite the next session's `delivered`,
 - calls `nak()` so another session can have the task,
-- publishes status `released`,
 - latches: stops pulling and sets presence to `stalled`.
 
 A later `update_task` or `finish_task` for a released task returns `isError` ("released, it will be redelivered"), clears the latch and resumes pulling. An unaccepted task has caused no side effects that the plugin knows of, so releasing is safe. A task seen twice is handled by the instruction "ignore a `task_id` you are already working on".
@@ -180,7 +181,7 @@ A later `update_task` or `finish_task` for a released task returns `isError` ("r
 
 **Session exit.** On stdin close or a signal the server calls `nak()` on the in-flight task, publishes presence `offline`, drains, and exits within 2s. A crash or SIGKILL has no clean-up; the task returns after `ack_wait`.
 
-**Redelivery and side effects.** `attempt` comes from `deliveryCount`. A new session seeing `attempt > 1` is told to inspect repo state first, because the previous attempt may have changed things. `max_attempts: 1` means no retry after a lost session; it fails with `attempts_exhausted`. A broker outage can add one to `deliveryCount`, which at worst ends a task early with a visible failure. That is accepted over tracking attempts separately.
+**Redelivery and side effects.** Attempts count pushes to Claude, not JetStream deliveries, and the stored `delivered` status published before each push is what records one, so nothing is pushed unless that record is stored. A delivery that reaches no push (a lost result lookup, a standby taking over, a broker outage) costs no attempt. When the status cannot give an attempt, `deliveryCount` stands in: it can overcount, but it keeps `max_attempts` a real bound. Known and accepted: a zombie session's `update_task` can overwrite the counter with its older attempt and undercount by one, bounded by the run timeout. A new session seeing `attempt > 1` is told to inspect repo state first, because the previous attempt may have changed things. `max_attempts: 1` means no retry after a lost session; it fails with `attempts_exhausted`.
 
 **Dedupe**, all three layers verified:
 
@@ -284,7 +285,7 @@ Rejected:
 | Identity | Publish | Subscribe |
 | --- | --- | --- |
 | orchestrator | `natter.task.*`, `natter.status.*.*`, JS API for its durable, publish and direct get on the three streams | `_INBOX.orchestrator.>` |
-| worker `<n>` | `natter.presence.<n>`, `natter.status.<n>.*`, `natter.result.<n>.*`, `$JS.API.INFO`, `$JS.API.STREAM.INFO.NATTER_TASKS`, `$JS.API.CONSUMER.INFO.NATTER_TASKS.task-<n>`, `$JS.API.CONSUMER.CREATE.NATTER_TASKS.task-<n>.natter.task.<n>`, `$JS.API.CONSUMER.MSG.NEXT.NATTER_TASKS.task-<n>`, `$JS.API.DIRECT.GET.NATTER_RESULTS.natter.result.<n>.>`, `$JS.ACK.NATTER_TASKS.task-<n>.>` | `_INBOX.<n>.>` |
+| worker `<n>` | `natter.presence.<n>`, `natter.status.<n>.*`, `natter.result.<n>.*`, `$JS.API.INFO`, `$JS.API.STREAM.INFO.NATTER_TASKS`, `$JS.API.CONSUMER.INFO.NATTER_TASKS.task-<n>`, `$JS.API.CONSUMER.CREATE.NATTER_TASKS.task-<n>.natter.task.<n>`, `$JS.API.CONSUMER.MSG.NEXT.NATTER_TASKS.task-<n>`, `$JS.API.DIRECT.GET.NATTER_RESULTS.natter.result.<n>.>`, `$JS.API.DIRECT.GET.NATTER_STATE.natter.status.<n>.>`, `$JS.ACK.NATTER_TASKS.task-<n>.>` | `_INBOX.<n>.>` |
 | admin (bootstrap only) | `$JS.API.STREAM.>` for `NATTER_*` | `_INBOX.admin.>` |
 | dashboard (optional) | none | `natter.>` |
 
@@ -417,7 +418,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `src/orchestrator.ts`, `src/instructions.ts`, `src/server.ts`, `test/orchestrator.test.ts`, `test/e2e.test.ts`.
 - Depends on: S2, S3. S4 for the end-to-end test.
-- Acceptance: `send_task` stores a task and a `queued` status; a retried publish does not duplicate; full queue returns `isError`; a result is pushed once with summary and `data_bytes`, `get_result` returns `data` and `artifacts`; a result stored while the orchestrator is down is pushed on the next start; `list_tasks` shows open and finished tasks after a restart; a result failing validation is dropped and logged; two real server processes, one per role, complete a task end to end.
+- Acceptance: `send_task` publishes the `queued` status before the task and never rewrites it, because a `queued` status means attempt 1 to a worker; a retried publish does not duplicate; full queue returns `isError`; a result is pushed once with summary and `data_bytes`, `get_result` returns `data` and `artifacts`; a result stored while the orchestrator is down is pushed on the next start; `list_tasks` shows open and finished tasks after a restart; a result failing validation is dropped and logged; two real server processes, one per role, complete a task end to end.
 - Cheapest check: `bun test test/orchestrator.test.ts test/e2e.test.ts`.
 - Worker: design judgment.
 

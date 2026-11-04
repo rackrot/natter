@@ -6,6 +6,9 @@ import { MAX_DESCRIPTION_BYTES, MAX_TIMEOUT_S, NAME_PATTERN } from './config'
 
 export const PROTOCOL_VERSION = 1
 export const MAX_MESSAGE_BYTES = 128 * 1024
+export const TASKS_STREAM_NAME = 'NATTER_TASKS'
+export const RESULTS_STREAM_NAME = 'NATTER_RESULTS'
+export const STATE_STREAM_NAME = 'NATTER_STATE'
 const MAX_JSON_DEPTH = 32
 const MAX_ARTIFACTS = 32
 
@@ -302,7 +305,10 @@ export type ParsedMessage =
   | {
       ok: false
       reason: FailureReason
-      /** Set only when the body is an object whose `task_id` is a valid nuid. */
+      /**
+       * Set only when the body is an object whose `task_id` is a valid nuid,
+       * and, for a task, whose `to` does not name another worker.
+       */
       task_id?: string
       issues?: string[]
     }
@@ -347,8 +353,14 @@ export function parseMessage(subject: string, data: Uint8Array): ParsedMessage {
   if (isUnsafeJson(body)) return fail('unsafe_content')
 
   const raw = body as Record<string, unknown>
+  // A recovered id gets a failure recorded under this subject's worker, so an
+  // envelope addressed to someone else must not offer one.
+  const misaddressed =
+    info.kind === 'task' && raw.to !== undefined && raw.to !== info.worker
   const task_id =
-    typeof raw.task_id === 'string' && NUID_PATTERN.test(raw.task_id)
+    typeof raw.task_id === 'string' &&
+    NUID_PATTERN.test(raw.task_id) &&
+    !misaddressed
       ? raw.task_id
       : undefined
 

@@ -1,8 +1,13 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js'
 import { resolveConfig, SHUTDOWN_DEADLINE_MS } from './config'
 import { startConnection } from './connection'
+import { instructionsFor } from './instructions'
+import { createWorker, WORKER_TOOLS } from './worker'
 
 // stdout belongs to MCP; everything else goes to stderr.
 const log = (line: string) => process.stderr.write(`nats-channel: ${line}\n`)
@@ -19,17 +24,38 @@ const mcp = new Server(
   { name: 'nats-channel', version: '0.0.1' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
-    instructions: config
-      ? `nats-channel ${config.role} role is a placeholder and does nothing yet.`
-      : 'nats-channel is inactive in this session.',
+    instructions: instructionsFor(config),
   },
 )
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
+// Connecting never blocks; the handlers below need these before MCP is up.
+const connection = config ? startConnection(config, log) : undefined
+const worker =
+  config?.role === 'worker' && connection
+    ? createWorker({
+        config,
+        connection,
+        push: (content, meta) =>
+          mcp.notification({
+            method: 'notifications/claude/channel',
+            params: { content, meta },
+          }),
+        log,
+        env: process.env,
+      })
+    : undefined
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: worker ? WORKER_TOOLS : [],
+}))
+if (worker) {
+  mcp.setRequestHandler(CallToolRequestSchema, ({ params }) =>
+    worker.callTool(params.name, params.arguments),
+  )
+  mcp.oninitialized = () => worker.start()
+}
 
 await mcp.connect(new StdioServerTransport())
-
-const connection = config ? startConnection(config, log) : undefined
 
 // When Claude Code closes the MCP connection, stdin gets EOF. A live NATS
 // handle would keep this process alive as an orphan, so exit explicitly.
@@ -39,7 +65,8 @@ function shutdown(): void {
   shuttingDown = true
   log('shutting down')
   setTimeout(() => process.exit(0), SHUTDOWN_DEADLINE_MS)
-  void Promise.resolve(connection?.close())
+  void Promise.resolve(worker?.stop())
+    .then(() => connection?.close())
     .catch((err: unknown) => log(`drain failed: ${err}`))
     .finally(() => process.exit(0))
 }

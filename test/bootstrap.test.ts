@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from 'bun:test'
+import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -31,6 +31,9 @@ import {
   taskSubject,
 } from '../src/protocol'
 import { startNats, type TestNats, until } from './support/nats'
+
+// A Bun test timeout kills tracked subprocesses, including a shared nats-server.
+setDefaultTimeout(15_000)
 
 // Maximum messages per subject reached; the client has no name for this code.
 const STREAM_STORE_FAILED = 10077

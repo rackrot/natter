@@ -15,8 +15,11 @@ import {
   MAX_MESSAGE_BYTES,
   PRESENCE_SUBJECTS,
   RESULT_SUBJECTS,
+  RESULTS_STREAM_NAME,
+  STATE_STREAM_NAME,
   STATUS_SUBJECTS,
   TASK_SUBJECTS,
+  TASKS_STREAM_NAME,
 } from './protocol'
 
 // Admin-only: creates or reconciles the three streams (plan 3.3). Workers
@@ -46,7 +49,7 @@ export type ManagedStream = Pick<
 >
 
 export const TASKS_STREAM: ManagedStream = {
-  name: 'NATTER_TASKS',
+  name: TASKS_STREAM_NAME,
   subjects: [TASK_SUBJECTS],
   retention: RetentionPolicy.Workqueue,
   storage: StorageType.File,
@@ -65,7 +68,7 @@ export const TASKS_STREAM: ManagedStream = {
 // cannot require the lastSubjectSequence: 0 header. A full stream rejects new
 // results rather than evicting recorded ones.
 export const RESULTS_STREAM: ManagedStream = {
-  name: 'NATTER_RESULTS',
+  name: RESULTS_STREAM_NAME,
   subjects: [RESULT_SUBJECTS],
   retention: RetentionPolicy.Limits,
   storage: StorageType.File,
@@ -82,7 +85,7 @@ export const RESULTS_STREAM: ManagedStream = {
 // Status and presence are core publishes the stream captures; the newest
 // replaces the previous one.
 export const STATE_STREAM: ManagedStream = {
-  name: 'NATTER_STATE',
+  name: STATE_STREAM_NAME,
   subjects: [STATUS_SUBJECTS, PRESENCE_SUBJECTS],
   retention: RetentionPolicy.Limits,
   storage: StorageType.File,

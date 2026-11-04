@@ -12,6 +12,8 @@ export interface TestNats {
   start(): Promise<void>
   stop(): Promise<void>
   restart(): Promise<void>
+  /** Brings a server killed under a test back, on the same port and store. */
+  revive(): Promise<void>
   /** Stops the server and removes the store directory. */
   cleanup(): Promise<void>
 }
@@ -27,7 +29,9 @@ async function freePort(): Promise<number> {
   return port
 }
 
-export const until = async (check: () => Promise<boolean>, ms = 5000) => {
+// Below Bun's 5s default test timeout, so a slow condition fails its own test.
+// A timeout would also kill every subprocess Bun tracks, shared servers included.
+export const until = async (check: () => Promise<boolean>, ms = 4000) => {
   const deadline = Date.now() + ms
   while (!(await check())) {
     if (Date.now() > deadline) throw new Error('condition not met in time')
@@ -51,6 +55,9 @@ export async function startNats(
   const monitorPort = await freePort()
   const storeDir = await mkdtemp(join(tmpdir(), 'natter-nats-'))
   let proc: Bun.Subprocess | undefined
+  // Bun's timeout kill reaches this at once, while a killed nats-server keeps
+  // answering, /healthz included, for tens of ms: no probe of it can tell.
+  let canary: Bun.Subprocess | undefined
 
   const args = [
     '-a',
@@ -83,9 +90,15 @@ export async function startNats(
       stdout: 'ignore',
       stderr: 'ignore',
     })
+    canary = Bun.spawn(['sleep', '86400'], {
+      stdout: 'ignore',
+      stderr: 'ignore',
+    })
     await ready()
   }
   const stop = async () => {
+    canary?.kill()
+    canary = undefined
     proc?.kill()
     await proc?.exited
     proc = undefined
@@ -120,6 +133,15 @@ export async function startNats(
     restart: async () => {
       await stop()
       await start()
+    },
+    revive: async () => {
+      if (!canary) return
+      // Gives a kill that has already landed time to be reported.
+      await Promise.race([canary.exited, Bun.sleep(5)])
+      if (canary.exitCode !== null || canary.signalCode !== null) {
+        await stop()
+        await start()
+      }
     },
     cleanup,
   }

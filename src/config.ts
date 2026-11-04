@@ -10,6 +10,13 @@ export const DEFAULT_CREDS_DIR = '~/.config/natter'
 const ADMIN_NAME = 'admin'
 // Shutdown must finish well inside the 3s the plugin promises on stdin close.
 export const SHUTDOWN_DEADLINE_MS = 2000
+const ACK_WAIT_MS = 120_000
+const WORKING_MS = 30_000
+const STARTUP_GRACE_MS = 5000
+const STREAM_RETRY_MS = 10_000
+const CONNECT_POLL_MS = 100
+const RESTART_MIN_MS = 1000
+const RESTART_MAX_MS = 15_000
 
 export type Role = 'orchestrator' | 'worker'
 
@@ -25,7 +32,7 @@ export interface Config {
 
 export type Resolved = { config: Config } | { inert: string }
 
-type Env = Record<string, string | undefined>
+export type Env = Record<string, string | undefined>
 
 // Empty counts as unset: unset `userConfig` values substitute as ''.
 const get = (env: Env, key: string) => env[key] || undefined
@@ -141,6 +148,23 @@ export function adminConfig(env: Env): Config {
     name: ADMIN_NAME,
     description: '',
     ...connectionSettings(env, ADMIN_NAME),
+  }
+}
+
+/** Plan 3.7 timers, in ms. Tests shorten any of them with `NATTER_TEST_*_MS`. */
+export function resolveTimers(env: Env) {
+  const ms = (key: string, fallback: number) => {
+    const value = Number(env[`NATTER_TEST_${key}_MS`])
+    return value > 0 ? value : fallback
+  }
+  return {
+    ackWait: ms('ACK_WAIT', ACK_WAIT_MS),
+    working: ms('WORKING', WORKING_MS),
+    startupGrace: ms('STARTUP_GRACE', STARTUP_GRACE_MS),
+    streamRetry: ms('STREAM_RETRY', STREAM_RETRY_MS),
+    connectPoll: ms('CONNECT_POLL', CONNECT_POLL_MS),
+    restartMin: ms('RESTART_MIN', RESTART_MIN_MS),
+    restartMax: ms('RESTART_MAX', RESTART_MAX_MS),
   }
 }
 
