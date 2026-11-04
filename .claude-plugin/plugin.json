@@ -5,5 +5,30 @@
   "author": { "name": "rackrot" },
   "license": "MIT",
   "keywords": ["nats", "channel", "mcp", "pubsub", "orchestration"],
-  "channels": [{ "server": "nats-channel", "displayName": "NATS" }]
+  "channels": [
+    {
+      "server": "nats-channel",
+      "displayName": "NATS",
+      "userConfig": {
+        "nats_url": {
+          "type": "string",
+          "title": "NATS URL",
+          "description": "NATS server URL. Non-loopback hosts need tls:// and a seed.",
+          "default": "nats://127.0.0.1:4222"
+        },
+        "creds_dir": {
+          "type": "directory",
+          "title": "Credentials directory",
+          "description": "Directory holding <name>.nk seed files.",
+          "default": "~/.config/natter"
+        },
+        "ca_file": {
+          "type": "file",
+          "title": "CA file",
+          "description": "Optional CA certificate for tls:// URLs. Leave empty for the system store.",
+          "default": ""
+        }
+      }
+    }
+  ]
 }

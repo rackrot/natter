@@ -9,7 +9,12 @@
         "--shell=bun",
         "--silent",
         "start"
-      ]
+      ],
+      "env": {
+        "NATTER_UC_URL": "${user_config.nats_url}",
+        "NATTER_UC_CREDS_DIR": "${user_config.creds_dir}",
+        "NATTER_UC_CA_FILE": "${user_config.ca_file}"
+      }
     }
   }
 }
