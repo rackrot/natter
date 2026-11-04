@@ -4,6 +4,7 @@ import { basename, join } from 'node:path'
 
 export const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/
 export const MAX_DESCRIPTION_BYTES = 512
+export const MAX_TIMEOUT_S = 86400
 export const DEFAULT_NATS_URL = 'nats://127.0.0.1:4222'
 export const DEFAULT_CREDS_DIR = '~/.config/natter'
 // Shutdown must finish well inside the 3s the plugin promises on stdin close.
