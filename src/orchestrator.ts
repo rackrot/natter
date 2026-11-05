@@ -894,6 +894,9 @@ export function createOrchestrator({
           !isStale(msg, timers.stale)
         ) {
           reasons.push('waiting_permission')
+        } else if (row?.state !== 'waiting_permission') {
+          // The prompt was answered, so the next one on this task alerts too.
+          delete raised.get(sent.task_id)?.pushes.waiting_permission
         }
         if (isOverdue(sent)) reasons.push('overdue')
         for (const reason of reasons) {

@@ -237,6 +237,25 @@ test('the resumed hook moves the row back to accepted and clears the marker', as
   await until(async () => (await stateOf(orchestrator, task_id)) === 'accepted')
 })
 
+test('a second prompt on the same task alerts again once the first has cleared', async () => {
+  const { name, sessionId, orchestrator, task_id } = await holdingWorker()
+  const stdin = { session_id: sessionId }
+  const prompt = () => runHook({ name, env: hookEnv(name), stdin })
+  await until(async () => (await heldFiles()).includes(sessionId))
+
+  await prompt()
+  await until(async () => attentionFor(orchestrator, task_id).length === 1)
+
+  await runHook({ name, mode: 'resumed', env: hookEnv(name), stdin })
+  await until(async () => (await stateOf(orchestrator, task_id)) === 'accepted')
+  await Bun.sleep(3 * SWEEP_MS)
+
+  await prompt()
+  await until(async () => attentionFor(orchestrator, task_id).length === 2)
+  await Bun.sleep(6 * SWEEP_MS)
+  expect(attentionFor(orchestrator, task_id)).toHaveLength(2)
+})
+
 test('no role, no held task, NATS down or bad input exits 0 in time and writes nothing', async () => {
   const { name, sessionId } = await holdingWorker()
   await until(async () => (await heldFiles()).includes(sessionId))
