@@ -20,10 +20,12 @@ import { NATS_UNAVAILABLE } from '../src/orchestrator'
 import {
   encodeEnvelope,
   mintTaskId,
+  presenceSubject,
   resultSubject,
   taskSubject,
 } from '../src/protocol'
 import { startNats, type TestNats, until } from './support/nats'
+import { seen } from './support/presence'
 import {
   callTool,
   type Session,
@@ -78,6 +80,15 @@ const queued = async (worker: string) => {
   return info.state.subjects?.[subject] ?? 0
 }
 
+/** send_task refuses a name until the worker's first heartbeat is stored. */
+const heardFrom = (worker: string) =>
+  until(async () => {
+    const msg = await jsm.direct.getMessage('NATTER_PRESENCE', {
+      last_by_subj: presenceSubject(worker),
+    })
+    return msg !== null
+  })
+
 beforeAll(async () => {
   nats = await startNats({ jetstream: true })
   nc = await connect({
@@ -113,6 +124,7 @@ test('two server processes, one per role, complete a task end to end', async () 
   const name = `w-${crypto.randomUUID()}`
   const orchestrator = await start('orchestrator', 'orchestrator')
   const worker = await start('worker', name)
+  await heardFrom(name)
 
   const { task_id } = answer(
     await callTool(orchestrator, 'send_task', {
@@ -187,6 +199,7 @@ test('a forger holding the real id cannot hold off the honest result', async () 
   const forger = `w-${crypto.randomUUID()}`
   const orchestrator = await start('orchestrator', 'orchestrator')
   const worker = await start('worker', name)
+  await heardFrom(name)
   const { task_id } = answer(
     await callTool(orchestrator, 'send_task', {
       to: name,
@@ -246,6 +259,7 @@ test('a forger holding the real id cannot hold off the honest result', async () 
 test('a task sent to a worker that is not running reaches it when it starts', async () => {
   const name = `w-${crypto.randomUUID()}`
   const orchestrator = await start('orchestrator', 'orchestrator')
+  await seen(jetstream(nc), name, { state: 'offline' })
   const { task_id } = answer(
     await callTool(orchestrator, 'send_task', {
       to: name,

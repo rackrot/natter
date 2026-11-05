@@ -19,17 +19,20 @@ import {
 } from '@nats-io/transport-node'
 import {
   bootstrapStreams,
+  PRESENCE_STREAM,
   RESULTS_STREAM,
   SENT_STREAM,
   STATE_STREAM,
   STREAMS,
   TASKS_STREAM,
 } from '../src/bootstrap'
+import { MAX_TIMEOUT_S } from '../src/config'
 import {
   MAX_MESSAGE_BYTES,
   presenceSubject,
   resultSubject,
   sentSubject,
+  statusSubject,
   taskSubject,
 } from '../src/protocol'
 import { startNats, type TestNats, until } from './support/nats'
@@ -139,12 +142,13 @@ afterAll(async () => {
   await nats?.cleanup()
 })
 
-test('creates the four streams with the plan settings', async () => {
+test('creates the five streams with the plan settings', async () => {
   const outcomes = await bootstrapStreams(jsm)
   expect(outcomes.map((o) => [o.name, o.action])).toEqual([
     ['NATTER_TASKS', 'created'],
     ['NATTER_RESULTS', 'created'],
     ['NATTER_STATE', 'created'],
+    ['NATTER_PRESENCE', 'created'],
     ['NATTER_SENT', 'created'],
   ])
 
@@ -181,7 +185,7 @@ test('creates the four streams with the plan settings', async () => {
   expect(await managed(STATE_STREAM)).toEqual({
     ...base,
     name: 'NATTER_STATE',
-    subjects: ['natter.status.*.*', 'natter.presence.*'],
+    subjects: ['natter.status.*.*'],
     retention: 'limits',
     max_age: nanos(14 * day),
     max_msgs_per_subject: 1,
@@ -189,6 +193,19 @@ test('creates the four streams with the plan settings', async () => {
     discard_new_per_subject: false,
     allow_direct: true,
     max_bytes: 256 * MIB,
+  })
+  expect(await managed(PRESENCE_STREAM)).toEqual({
+    ...base,
+    name: 'NATTER_PRESENCE',
+    subjects: ['natter.presence.*'],
+    retention: 'limits',
+    max_age: nanos(14 * day),
+    max_msgs_per_subject: 1,
+    discard: 'old',
+    discard_new_per_subject: false,
+    allow_direct: true,
+    max_msg_size: 4096,
+    max_bytes: 64 * MIB,
   })
   expect(await managed(SENT_STREAM)).toEqual({
     ...base,
@@ -228,6 +245,49 @@ test('a record refuses a body over the message limit', async () => {
   ).rejects.toThrow()
 })
 
+test('a task cannot outlive the results stream, so aged_out hides no open task', () => {
+  const longest = TASKS_STREAM.max_age + nanos(MAX_TIMEOUT_S * 1000)
+  expect(longest).toBeLessThan(RESULTS_STREAM.max_age)
+})
+
+test('a heartbeat over 4 KiB is rejected, one at the limit is stored', async () => {
+  const js = jetstream(nc)
+  await expect(
+    js.publish(presenceSubject('big'), new Uint8Array(4097)),
+  ).rejects.toThrow()
+  const edge = new Uint8Array(4096 - 1024)
+  expect((await js.publish(presenceSubject('big'), edge)).seq).toBeGreaterThan(
+    0,
+  )
+})
+
+test('a server with presence on NATTER_STATE moves it to its own stream', async () => {
+  await onFreshServer(async (_server, conn, manager) => {
+    await manager.streams.add({
+      ...STATE_STREAM,
+      subjects: [...STATE_STREAM.subjects, 'natter.presence.*'],
+    })
+
+    const outcomes = await bootstrapStreams(manager)
+
+    expect(outcomes.find((o) => o.name === 'NATTER_STATE')).toMatchObject({
+      action: 'updated',
+      changed: ['subjects'],
+    })
+    expect(outcomes.find((o) => o.name === 'NATTER_PRESENCE')?.action).toBe(
+      'created',
+    )
+    const { seq } = await jetstream(conn).publish(
+      presenceSubject('alpha'),
+      'here',
+    )
+    const stored = await manager.direct.getMessage('NATTER_PRESENCE', {
+      last_by_subj: presenceSubject('alpha'),
+    })
+    expect(stored?.seq).toBe(seq)
+  })
+})
+
 test('a run keeps the records of a NATTER_SENT that has drifted', async () => {
   await onFreshServer(async (_server, conn, manager) => {
     await manager.streams.add({ ...SENT_STREAM, max_bytes: 512 * MIB })
@@ -265,6 +325,7 @@ test('a second run changes nothing and keeps stored messages', async () => {
   const outcomes = await bootstrapStreams(jsm)
 
   expect(outcomes.map((o) => o.action)).toEqual([
+    'unchanged',
     'unchanged',
     'unchanged',
     'unchanged',
@@ -334,6 +395,7 @@ test('a drifted stream is updated back without losing messages', async () => {
       0,
       0,
     ],
+    ['NATTER_PRESENCE', 'unchanged', [], undefined, undefined],
     ['NATTER_SENT', 'unchanged', [], undefined, undefined],
   ])
   for (const stream of STREAMS) {
@@ -345,7 +407,7 @@ test('a drifted stream is updated back without losing messages', async () => {
 test('a tightened limit shows what it trimmed', async () => {
   await onFreshServer(async (server, conn, manager) => {
     await manager.streams.add({ ...STATE_STREAM, max_msgs_per_subject: 5 })
-    const subject = presenceSubject('alpha')
+    const subject = statusSubject('alpha', nuid.next())
     for (let i = 0; i < 5; i++) await jetstream(conn).publish(subject, `p${i}`)
 
     const { code, stdout } = await runBootstrap(server.url)
@@ -368,7 +430,7 @@ test.each([
   await onFreshServer(async (_server, conn, manager) => {
     await manager.streams.add({ ...RESULTS_STREAM, max_msgs_per_subject: 5 })
     await manager.streams.add({ ...STATE_STREAM, ...drift })
-    await jetstream(conn).publish(presenceSubject('alpha'), 'here')
+    await jetstream(conn).publish(statusSubject('alpha', nuid.next()), 'here')
 
     await expect(bootstrapStreams(manager)).rejects.toThrow(
       `NATTER_STATE.${key}`,
@@ -449,7 +511,9 @@ test('a message over max_msg_size is rejected, one at the limit is stored', asyn
   await expect(
     js.publish(resultSubject('big', nuid.next()), big),
   ).rejects.toThrow()
-  await expect(js.publish(presenceSubject('big'), big)).rejects.toThrow()
+  await expect(
+    js.publish(statusSubject('big', nuid.next()), big),
+  ).rejects.toThrow()
   const edge = new Uint8Array(MAX_MESSAGE_BYTES - 1024)
   expect((await js.publish(taskSubject('big'), edge)).seq).toBeGreaterThan(0)
 })

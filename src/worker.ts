@@ -18,12 +18,16 @@ import {
 import { z } from 'zod'
 import { type Config, type Env, resolveTimers } from './config'
 import type { Connection } from './connection'
+import { type PresenceStatus, presenceEncoder } from './presence'
 import {
   buildMeta,
+  DIRECT_READ,
   encodeEnvelope,
+  isReflected,
   type ParsedMessage,
   PROTOCOL_VERSION,
   parseMessage,
+  presenceSubject,
   RESULTS_STREAM_NAME,
   type Result,
   ResultSchema,
@@ -155,10 +159,11 @@ export function createWorker({
   const durable = `task-${config.name}`
   const stopping = new AbortController()
   let loop: Promise<void> | undefined
+  let beating: Promise<void> | undefined
   let messages: ConsumerMessages | undefined
   let inFlight: InFlight | undefined
   // Set by the accept timeout, and keeps this session from pulling until a tool
-  // call for that task clears it. S7 reports this as presence `stalled`.
+  // call for that task clears it. Presence reports this as `stalled`.
   let released: string | undefined
   // The answer to late tool calls for tasks the run timeout ended.
   const closed = new Map<unknown, ToolResult>()
@@ -170,6 +175,48 @@ export function createWorker({
 
   const bootstrapHint = () =>
     `${[...missingStreams].join(' and ')} missing: run mise run bootstrap`
+
+  const presenceBytes = presenceEncoder(config, env, instance, timers.heartbeat)
+
+  // A core publish, sync and buffered through a reconnect. Task handling calls
+  // this, so a failure stops here: a lost heartbeat is fine (plan 3.3).
+  function publishPresence(status: PresenceStatus): void {
+    try {
+      connection.nc?.publish(
+        presenceSubject(config.name),
+        presenceBytes(status),
+      )
+    } catch (err) {
+      log(`presence failed: ${describeError(err)}`)
+    }
+  }
+
+  // The latest state, on every change and every beat. After stop() only the
+  // `offline` it publishes may go out.
+  function announce(): void {
+    if (stopping.signal.aborted) return
+    if (released !== undefined) {
+      publishPresence({ state: 'stalled', task_id: released })
+    } else if (inFlight) {
+      publishPresence({ state: 'busy', task_id: inFlight.task.task_id })
+    } else {
+      publishPresence({ state: 'idle' })
+    }
+  }
+
+  // The first beat goes out as soon as the connection is up: send_task refuses
+  // a worker it has never seen.
+  async function beat(): Promise<void> {
+    while (!stopping.signal.aborted) {
+      if (connection.nc) {
+        announce()
+        await sleep(timers.heartbeat)
+        continue
+      }
+      if (connection.unavailable) return
+      await sleep(timers.connectPoll)
+    }
+  }
 
   // Without this the broker redelivers at ack_wait, however long the wait.
   const keepWorking = (current: () => JsMsg) =>
@@ -209,6 +256,7 @@ export function createWorker({
       ),
     }
     inFlight = held
+    announce()
     return held
   }
 
@@ -216,6 +264,7 @@ export function createWorker({
     clearInterval(held.working)
     clearTimeout(held.deadline)
     if (inFlight === held) inFlight = undefined
+    announce()
   }
 
   /** Plan 3.3, no delivery ack: either the session is deaf or it is too busy. */
@@ -373,10 +422,16 @@ export function createWorker({
     }
   }
 
-  const storedResult = (nc: NatsConnection, taskId: string) =>
+  const resultOnSubject = (nc: NatsConnection, taskId: string) =>
     onStream(RESULTS_STREAM_NAME, () =>
       lastMessage(nc, RESULTS_STREAM_NAME, resultSubject(config.name, taskId)),
     )
+
+  /** A real result: a reflected one proves nothing, so the task still runs. */
+  async function storedResult(nc: NatsConnection, taskId: string) {
+    const stored = await resultOnSubject(nc, taskId)
+    return stored && !isReflected(stored.header, DIRECT_READ) ? stored : null
+  }
 
   /**
    * First result wins, and this says whose it is. Anything else throws, and
@@ -404,10 +459,13 @@ export function createWorker({
     // Also where this session's own retry lands after a lost PubAck. Only
     // `instance` says whose result it is, and a `reason` marks one the plugin
     // wrote, not this finish_task.
-    const stored = await storedResult(nc, taskId)
+    // Not storedResult: a reflected message still holds the subject, and a
+    // call retrying as if it were free would never end.
+    const stored = await resultOnSubject(nc, taskId)
     if (!stored) throw new Error('the stored result is gone, call again')
     const parsed = parseMessage(subject, stored.data)
     if (
+      isReflected(stored.header, DIRECT_READ) ||
       !parsed.ok ||
       parsed.envelope.type !== 'result' ||
       parsed.envelope.instance !== instance
@@ -513,7 +571,8 @@ export function createWorker({
       const stored = await lastMessage(nc, STATE_STREAM_NAME, subject)
       if (!stored) return 1
       const parsed = parseMessage(subject, stored.data)
-      if (parsed.ok && parsed.envelope.type === 'status') {
+      const reflected = isReflected(stored.header, DIRECT_READ)
+      if (!reflected && parsed.ok && parsed.envelope.type === 'status') {
         const { state, attempt } = parsed.envelope
         if (attempt !== undefined) {
           return state === 'released' ? attempt : attempt + 1
@@ -582,6 +641,12 @@ export function createWorker({
 
   // Plan 3.3 steps 1 to 6. Whatever this throws leaves the message unacked.
   async function handleMessage(nc: NatsConnection, msg: JsMsg): Promise<void> {
+    // Ahead of parsing: an invalid task gets a result, and this must not.
+    if (isReflected(msg.headers)) {
+      log('dropped a reflected task')
+      msg.term('reflected')
+      return
+    }
     const parsed = parseMessage(msg.subject, msg.data)
     if (!parsed.ok) return rejectTask(nc, msg, parsed)
     // The consumer's filter makes this a task subject, which selects TaskSchema.
@@ -753,6 +818,7 @@ export function createWorker({
   return {
     start() {
       loop ??= run()
+      beating ??= beat()
     },
 
     async stop() {
@@ -767,7 +833,9 @@ export function createWorker({
         // A result on its way settles the task, redelivered or not.
         if (!held.finishing) handBack(held.msg)
       }
-      await loop
+      // Before the loop, for the same reason. The drain that follows flushes it.
+      if (beating) publishPresence({ state: 'offline' })
+      await Promise.all([loop, beating])
     },
 
     async callTool(name, args) {
@@ -784,6 +852,7 @@ export function createWorker({
       if (settled) return settled
       if (released !== undefined && released === args?.task_id) {
         released = undefined
+        announce()
         return toolError(RELEASED)
       }
       const held = inFlight

@@ -4,6 +4,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import manifest from '../.claude-plugin/plugin.json'
 import { resolveConfig, SHUTDOWN_DEADLINE_MS } from './config'
 import { startConnection } from './connection'
 import { instructionsFor } from './instructions'
@@ -22,7 +23,7 @@ log(
 )
 
 const mcp = new Server(
-  { name: 'nats-channel', version: '0.0.1' },
+  { name: 'nats-channel', version: manifest.version },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions: instructionsFor(config),

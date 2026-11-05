@@ -9,10 +9,12 @@ import {
   type StreamConfig,
 } from '@nats-io/jetstream'
 import { connect, nanos } from '@nats-io/transport-node'
-import { adminConfig, resolveTransport } from './config'
+import { adminConfig, RESULTS_MAX_AGE_MS, resolveTransport } from './config'
 import { connectOptions } from './connection'
 import {
   MAX_MESSAGE_BYTES,
+  PRESENCE_MAX_BYTES,
+  PRESENCE_STREAM_NAME,
   PRESENCE_SUBJECTS,
   RESULT_SUBJECTS,
   RESULTS_STREAM_NAME,
@@ -24,7 +26,7 @@ import {
   TASKS_STREAM_NAME,
 } from './protocol'
 
-// Admin-only: creates or reconciles the four streams (plan 3.3). Workers
+// Admin-only: creates or reconciles the five streams (plan 3.3). Workers
 // never create streams. Standalone command, not imported by src/server.ts.
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -33,6 +35,7 @@ const TASKS_MAX_BYTES = 256 * MIB
 const RESULTS_MAX_BYTES = 1024 * MIB
 const STATE_MAX_BYTES = 256 * MIB
 const SENT_MAX_BYTES = 256 * MIB
+const PRESENCE_MAX_MSG_BYTES = 4 * 1024
 
 /** The settings this command owns; everything else is left at server defaults. */
 export type ManagedStream = Pick<
@@ -75,7 +78,7 @@ export const RESULTS_STREAM: ManagedStream = {
   subjects: [RESULT_SUBJECTS],
   retention: RetentionPolicy.Limits,
   storage: StorageType.File,
-  max_age: nanos(14 * DAY_MS),
+  max_age: nanos(RESULTS_MAX_AGE_MS),
   max_msgs_per_subject: 1,
   discard: DiscardPolicy.New,
   discard_new_per_subject: true,
@@ -85,11 +88,11 @@ export const RESULTS_STREAM: ManagedStream = {
   max_bytes: RESULTS_MAX_BYTES,
 }
 
-// Status and presence are core publishes the stream captures; the newest
-// replaces the previous one.
+// Status is a core publish the stream captures, `delivered` a JetStream one;
+// the newest replaces the previous one.
 export const STATE_STREAM: ManagedStream = {
   name: STATE_STREAM_NAME,
-  subjects: [STATUS_SUBJECTS, PRESENCE_SUBJECTS],
+  subjects: [STATUS_SUBJECTS],
   retention: RetentionPolicy.Limits,
   storage: StorageType.File,
   max_age: nanos(14 * DAY_MS),
@@ -102,8 +105,28 @@ export const STATE_STREAM: ManagedStream = {
   max_bytes: STATE_MAX_BYTES,
 }
 
+// Heartbeats, apart from status rows so a flood of those cannot evict one. A
+// worker's ACL allows publishing only its own subject and each keeps one
+// message, so no worker can push out another's with a publish. The reply route
+// of plan 3.6 is the open exception. Comes after NATTER_STATE in STREAMS: a server
+// with presence still on that stream has to give the subject up first.
+export const PRESENCE_STREAM: ManagedStream = {
+  name: PRESENCE_STREAM_NAME,
+  subjects: [PRESENCE_SUBJECTS],
+  retention: RetentionPolicy.Limits,
+  storage: StorageType.File,
+  max_age: nanos(14 * DAY_MS),
+  max_msgs_per_subject: 1,
+  discard: DiscardPolicy.Old,
+  discard_new_per_subject: false,
+  duplicate_window: nanos(2 * 60 * 1000),
+  allow_direct: true,
+  max_msg_size: PRESENCE_MAX_MSG_BYTES,
+  max_bytes: PRESENCE_MAX_BYTES,
+}
+
 // The orchestrator's record of each send, what every result is checked against
-// (plan 3.6). Only the orchestrator can write it, so nothing here is evicted to
+// (plan 3.6). Only the orchestrator can publish on it, so nothing is evicted to
 // make room, and it outlives NATTER_RESULTS. Never drop it: every result still
 // in the durable would then be terminated for having no record.
 export const SENT_STREAM: ManagedStream = {
@@ -125,6 +148,7 @@ export const STREAMS = Object.freeze([
   TASKS_STREAM,
   RESULTS_STREAM,
   STATE_STREAM,
+  PRESENCE_STREAM,
   SENT_STREAM,
 ])
 for (const stream of STREAMS) {

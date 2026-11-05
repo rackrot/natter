@@ -674,7 +674,7 @@ test('with status capture broken nothing is pushed, however many sessions are lo
     const { config } = await manager.streams.info('NATTER_STATE')
     await manager.streams.update('NATTER_STATE', {
       ...config,
-      subjects: ['natter.presence.*'],
+      subjects: ['natter.nothing.*'],
     })
     const delivered = async () =>
       manager.consumers.info('NATTER_TASKS', `task-${name}`).then(

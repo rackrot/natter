@@ -45,6 +45,7 @@ import {
   taskSubject,
 } from '../src/protocol'
 import { startNats, type TestNats, until } from './support/nats'
+import { seen } from './support/presence'
 import {
   callTool,
   type Session,
@@ -64,6 +65,8 @@ const NO_CREDS = join(tmpdir(), 'natter-no-creds')
 let nats: TestNats
 let nc: NatsConnection
 let jsm: JetStreamManager
+// The broker a test's sessions are on, which is where their workers must be seen.
+let currentNc: NatsConnection
 const sessions: Session[] = []
 
 const orchestratorEnv = (url: string, env: Record<string, string> = {}) => ({
@@ -110,12 +113,16 @@ const parsed = (reply: ToolReply) => {
   return JSON.parse(reply.content[0]?.text ?? '')
 }
 
+/** send_task refuses a name no worker has used. */
+const seenWorker = (worker: string) => seen(jetstream(currentNc), worker)
+
 const send = async (
   s: Pick<Session, 'client'>,
   to: string,
   args: Record<string, unknown> = {},
-) =>
-  parsed(
+) => {
+  await seenWorker(to)
+  return parsed(
     await callTool(s, 'send_task', {
       to,
       title: 'the title',
@@ -123,6 +130,7 @@ const send = async (
       ...args,
     }),
   ) as { task_id: string; worker_state: string }
+}
 
 interface Row {
   task_id: string
@@ -422,10 +430,12 @@ const onFreshServer = async (
   const server = await startNats({ jetstream: true })
   const conn = await connect({ servers: server.url })
   const manager = await jetstreamManager(conn)
+  currentNc = conn
   try {
     if (bootstrap) await bootstrapStreams(manager)
     await run(server, jetstream(conn), manager)
   } finally {
+    currentNc = nc
     await Promise.all(sessions.splice(0).map((s) => s.close()))
     await conn.close()
     await server.cleanup()
@@ -439,6 +449,7 @@ beforeAll(async () => {
     maxReconnectAttempts: -1,
     reconnectTimeWait: 100,
   })
+  currentNc = nc
   jsm = await jetstreamManager(nc)
   await bootstrapStreams(jsm)
 })
@@ -455,9 +466,13 @@ beforeEach(async () => {
   )
   await jsm.consumers.delete('NATTER_RESULTS', 'results').catch(() => {})
   await Promise.all(
-    ['NATTER_TASKS', 'NATTER_RESULTS', 'NATTER_STATE', 'NATTER_SENT'].map(
-      (stream) => jsm.streams.purge(stream),
-    ),
+    [
+      'NATTER_TASKS',
+      'NATTER_RESULTS',
+      'NATTER_STATE',
+      'NATTER_PRESENCE',
+      'NATTER_SENT',
+    ].map((stream) => jsm.streams.purge(stream)),
   )
 })
 
@@ -487,6 +502,7 @@ test('only the orchestrator role has the orchestrator tools', async () => {
   expect(await names(orchestrator)).toEqual([
     'get_result',
     'list_tasks',
+    'list_workers',
     'send_task',
   ])
   expect(await names(worker)).toEqual(['finish_task', 'update_task'])
@@ -595,6 +611,7 @@ test('a record that cannot be stored stops the send', async () => {
       if (to.startsWith('natter.sent.')) throw new errors.TimeoutError()
       return real(to, ...rest)
     }
+    await seenWorker(worker)
     const publishes = aroundTaskPublish(conn, worker, {})
 
     const reply = await callTool(session, 'send_task', {
@@ -661,6 +678,7 @@ test('a publish that never gets its PubAck is reported, and its row is left as i
       },
     })
 
+    await seenWorker(worker)
     const reply = await callTool(session, 'send_task', {
       to: worker,
       title: 'the title',
@@ -715,9 +733,10 @@ test('a full queue returns isError, stores nothing more, and the refused task re
 })
 
 test('no responders may follow a try that landed, so the reply names the task', async () => {
-  await onFreshServer(async (server, _js, manager) => {
+  await onFreshServer(async (server, js, manager) => {
     const worker = freshName()
     const s = await startConnected({}, server.url)
+    await seen(js, worker)
     await manager.streams.delete('NATTER_TASKS')
 
     const reply = await callTool(s, 'send_task', {

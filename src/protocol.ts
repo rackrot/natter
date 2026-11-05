@@ -1,3 +1,4 @@
+import type { MsgHdrs } from '@nats-io/transport-node'
 import { z } from 'zod'
 import { MAX_DESCRIPTION_BYTES, MAX_TIMEOUT_S, NAME_PATTERN } from './config'
 
@@ -10,6 +11,8 @@ export const TASKS_STREAM_NAME = 'NATTER_TASKS'
 export const RESULTS_STREAM_NAME = 'NATTER_RESULTS'
 export const STATE_STREAM_NAME = 'NATTER_STATE'
 export const SENT_STREAM_NAME = 'NATTER_SENT'
+export const PRESENCE_STREAM_NAME = 'NATTER_PRESENCE'
+export const PRESENCE_MAX_BYTES = 64 * 1024 * 1024
 const MAX_JSON_DEPTH = 32
 const MAX_ARTIFACTS = 32
 
@@ -40,6 +43,21 @@ export function mintTaskId(): string {
 }
 
 export class WireError extends Error {}
+
+/** The `Nats-Stream` values a direct get adds to every message it answers with. */
+export const DIRECT_READ = 1
+
+/**
+ * True for a stored message that was the server's own answer to a direct get.
+ * ACLs check a request's subject, not its reply, so a worker can aim a permitted
+ * direct get of its own row at a subject it may not write, and a stream captures
+ * the answer (plan 3.6). Such a message keeps the `Nats-Stream` the server set,
+ * which no honest publish carries. Partial: it stops chosen content, not a fill.
+ */
+export const isReflected = (
+  headers: MsgHdrs | undefined,
+  addedByRead: 0 | typeof DIRECT_READ = 0,
+) => (headers?.values('Nats-Stream').length ?? 0) > addedByRead
 
 // ---------------------------------------------------------------- subjects
 
@@ -108,6 +126,9 @@ const REASONS = [
   'expired_in_queue',
   'invalid_task',
 ] as const
+/** Why a task needs a look (plan 3.5). In `meta` only, never on the wire. */
+export const ATTENTION_REASONS = ['stale', 'released', 'overdue'] as const
+export type AttentionReason = (typeof ATTENTION_REASONS)[number]
 
 const utf8Bytes = (s: string) => Buffer.byteLength(s, 'utf8')
 const bounded = (max: number, min = 0) =>
@@ -216,8 +237,9 @@ export const TaskSchema = z.object({
   depth: count,
 })
 
-// The orchestrator's own record of a send. Only its credential can write this
-// subject, so it is what every result is checked against (plan 3.6).
+// The orchestrator's own record of a send. Only its credential can publish on
+// this subject, so it is what every result is checked against (plan 3.6). A
+// reflected message can still land here, so readers refuse those.
 export const SentSchema = TaskSchema.pick({
   v: true,
   task_id: true,
@@ -482,7 +504,7 @@ const metaValidators = {
   attempt: positive,
   timeout_s: positive.max(MAX_TIMEOUT_S),
   outcome: z.enum(OUTCOMES),
-  reason: z.enum(REASONS),
+  reason: z.enum([...REASONS, ...ATTENTION_REASONS]),
   data_bytes: count,
 }
 

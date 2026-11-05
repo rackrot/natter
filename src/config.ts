@@ -10,6 +10,11 @@ export const DEFAULT_CREDS_DIR = '~/.config/natter'
 export const DEFAULT_TIMEOUT_S = 3600
 export const DEFAULT_QUEUE_TTL_S = 86400
 export const DEFAULT_MAX_ATTEMPTS = 3
+// Past created_at + queue_ttl_s + accept timeout + timeout_s (plan 3.5).
+export const OVERDUE_MARGIN_S = 300
+const DAY_MS = 24 * 60 * 60 * 1000
+/** How long NATTER_RESULTS keeps a result, so what a record can still prove. */
+export const RESULTS_MAX_AGE_MS = 14 * DAY_MS
 const ADMIN_NAME = 'admin'
 // Shutdown must finish well inside the 3s the plugin promises on stdin close.
 export const SHUTDOWN_DEADLINE_MS = 2000
@@ -21,6 +26,9 @@ const STREAM_RETRY_MS = 10_000
 const CONNECT_POLL_MS = 100
 const RESTART_MIN_MS = 1000
 const RESTART_MAX_MS = 15_000
+const HEARTBEAT_MS = 15_000
+const STALE_MS = 45_000
+const ATTENTION_SWEEP_MS = 30_000
 
 export type Role = 'orchestrator' | 'worker'
 
@@ -170,6 +178,10 @@ export function resolveTimers(env: Env) {
     connectPoll: ms('CONNECT_POLL', CONNECT_POLL_MS),
     restartMin: ms('RESTART_MIN', RESTART_MIN_MS),
     restartMax: ms('RESTART_MAX', RESTART_MAX_MS),
+    heartbeat: ms('HEARTBEAT', HEARTBEAT_MS),
+    stale: ms('STALE', STALE_MS),
+    attentionSweep: ms('ATTENTION_SWEEP', ATTENTION_SWEEP_MS),
+    resultsMaxAge: ms('RESULTS_MAX_AGE', RESULTS_MAX_AGE_MS),
   }
 }
 
