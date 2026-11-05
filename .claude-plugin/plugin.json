@@ -1,0 +1,52 @@
+{
+  "name": "nats-channel",
+  "description": "Let your Claude Code sessions talk over NATS. Orchestrate repo-level agents with pub/sub, durable queues, and structured results.",
+  "version": "0.0.1",
+  "author": { "name": "rackrot" },
+  "license": "MIT",
+  "keywords": ["nats", "channel", "mcp", "pubsub", "orchestration"],
+  "mcpServers": {
+    "nats-channel": {
+      "command": "bun",
+      "args": [
+        "run",
+        "--cwd",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "--shell=bun",
+        "--silent",
+        "start"
+      ],
+      "env": {
+        "NATTER_UC_URL": "${user_config.nats_url}",
+        "NATTER_UC_CREDS_DIR": "${user_config.creds_dir}",
+        "NATTER_UC_CA_FILE": "${user_config.ca_file}"
+      }
+    }
+  },
+  "channels": [
+    {
+      "server": "nats-channel",
+      "displayName": "NATS",
+      "userConfig": {
+        "nats_url": {
+          "type": "string",
+          "title": "NATS URL",
+          "description": "NATS server URL. Non-loopback hosts need tls:// and a seed.",
+          "default": "nats://127.0.0.1:4222"
+        },
+        "creds_dir": {
+          "type": "directory",
+          "title": "Credentials directory",
+          "description": "Directory holding natter.nk, the shared seed.",
+          "default": "~/.config/natter"
+        },
+        "ca_file": {
+          "type": "file",
+          "title": "CA file",
+          "description": "Optional CA certificate for tls:// URLs. Leave empty for the system store.",
+          "default": ""
+        }
+      }
+    }
+  ]
+}
