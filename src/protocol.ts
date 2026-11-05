@@ -13,6 +13,10 @@ export const STATE_STREAM_NAME = 'NATTER_STATE'
 export const SENT_STREAM_NAME = 'NATTER_SENT'
 export const PRESENCE_STREAM_NAME = 'NATTER_PRESENCE'
 export const PRESENCE_MAX_BYTES = 64 * 1024 * 1024
+/** The orchestrator's durable on NATTER_RESULTS. */
+export const RESULTS_DURABLE = 'results'
+/** A worker's durable on NATTER_TASKS. */
+export const workerDurable = (name: string) => `task-${name}`
 const MAX_JSON_DEPTH = 32
 const MAX_ARTIFACTS = 32
 

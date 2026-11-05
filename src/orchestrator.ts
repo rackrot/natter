@@ -44,6 +44,7 @@ import {
   parseMessage,
   presenceSubject,
   RESULT_SUBJECTS,
+  RESULTS_DURABLE,
   RESULTS_STREAM_NAME,
   type Result,
   resultSubject,
@@ -67,7 +68,6 @@ import type { ToolResult } from './worker'
 // The orchestrator side of plan 3.3 and 3.4: publish tasks, push results from
 // the `results` durable, and answer from the streams, which are the record.
 
-const DURABLE = 'results'
 // The client has no name for this code.
 const CONSUMER_ALREADY_EXISTS = 10148
 const MAX_ACK_PENDING = 8
@@ -934,7 +934,7 @@ export function createOrchestrator({
     try {
       await jsm.consumers.add(RESULTS_STREAM_NAME, {
         ...settings,
-        durable_name: DURABLE,
+        durable_name: RESULTS_DURABLE,
         ack_policy: AckPolicy.Explicit,
       })
     } catch (err) {
@@ -944,7 +944,7 @@ export function createOrchestrator({
       ) {
         throw err
       }
-      await jsm.consumers.update(RESULTS_STREAM_NAME, DURABLE, settings)
+      await jsm.consumers.update(RESULTS_STREAM_NAME, RESULTS_DURABLE, settings)
     }
   }
 
@@ -957,7 +957,7 @@ export function createOrchestrator({
     await ensureConsumer(jsm)
     const consumer = await jsm
       .jetstream()
-      .consumers.get(RESULTS_STREAM_NAME, DURABLE)
+      .consumers.get(RESULTS_STREAM_NAME, RESULTS_DURABLE)
     messages = await consumer.consume({ abort_on_missing_resource: true })
     if (stopping.signal.aborted) messages.stop()
     for await (const msg of messages) {

@@ -175,8 +175,8 @@ const same = (a: unknown, b: unknown) =>
   JSON.stringify(Array.isArray(a) ? [...a].sort() : a) ===
   JSON.stringify(Array.isArray(b) ? [...b].sort() : b)
 
-// The server omits booleans that are false.
-const diff = (want: ManagedStream, have: StreamConfig) =>
+/** The settings of `want` that `have` does not match. The server omits booleans that are false. */
+export const diff = (want: ManagedStream, have: StreamConfig) =>
   (Object.keys(want) as (keyof ManagedStream)[]).filter(
     (key) => !same(want[key], have[key] ?? false),
   )

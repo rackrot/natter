@@ -41,6 +41,7 @@ import {
   type Task,
   taskSubject,
   WireError,
+  workerDurable,
 } from './protocol'
 
 // The worker side of plan 3.3: pull one task at a time, hold it with
@@ -161,7 +162,7 @@ export function createWorker({
 }): Worker {
   const timers = resolveTimers(env)
   const instance = nuid.next()
-  const durable = `task-${config.name}`
+  const durable = workerDurable(config.name)
   const stopping = new AbortController()
   let loop: Promise<void> | undefined
   let beating: Promise<void> | undefined
