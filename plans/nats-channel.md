@@ -12,7 +12,7 @@ Done when all of these are observable:
 2. A task sent while the worker is offline is delivered when it starts.
 3. Killing a worker mid-task leads to redelivery to the next session, or to a terminal failure once attempts run out. Never to silence.
 4. A result published while the orchestrator is down is pushed when it returns, and stays readable with `get_result`.
-5. A worker credential cannot publish tasks, publish another worker's results, or read another worker's queue (test against a real `nats-server` with the shipped ACL template). The reply-subject route is an accepted risk, see 3.6.
+5. A non-loopback connection needs TLS and the shared nkey, and a wrong key or untrusted CA is refused.
 6. A session that has no `NATTER_ROLE`, or has the role but no loaded channel, never loses a task.
 7. `mise run check` passes.
 
@@ -295,6 +295,8 @@ Rejected:
 
 ### 3.6 Security
 
+**Scope decision.** natter is for personal use: one operator, their own machines, no external agents. So there is one shared nkey and no per-identity permissions. The ACL rows below describe a design that is not built; they stay as the record of what a multi-user deployment would need. What is built and stays: loopback default, TLS plus nkey off loopback, the `NATTER_SENT` record, and reader checks. Those also keep the ledger reliable, and removing them would mean reopening tested paths. Nothing new is added to defend against a hostile worker.
+
 **Threat.** NATS content reaches a session that can run tools. The plugin cannot see a publisher's identity per message, so sender authenticity comes entirely from publish ACLs.
 
 **Auth.** Self-hosted `nats-server` with static `authorization.users`, one nkey per identity, and a per-user permissions block. `deploy/nats-server.example.conf` ships the template, and the auth test boots that exact file so the docs cannot drift. Seeds live at `<creds_dir>/<name>.nk`, mode 0600; the server warns on anything looser. The name is validated by regex before the path is built, so a repo file cannot aim the path elsewhere. `userConfig` stores the directory, not a secret (`type: directory`). Decentralized JWT `.creds` are deferred until someone needs operator mode.
@@ -476,18 +478,20 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 - Cheapest check: `bun test test/limits.test.ts`.
 - Worker: mechanical.
 
-### S9. Auth and transport
+### S9. Shared auth and transport
 
-- Files: `deploy/nats-server.example.conf`, `src/connection.ts`, `test/auth.test.ts`, `test/support/nats.ts` (nkey and TLS fixtures).
+- Files: `deploy/nats-server.example.conf`, `src/config.ts`, `src/connection.ts`, `src/bootstrap.ts`, `test/auth.test.ts`, `test/support/nats.ts`.
 - Depends on: S4, S6, S7.
-- Acceptance against the shipped template: a full task round trip works with nkeys and per-user inbox prefixes; worker cannot publish `natter.task.*`, cannot publish another worker's result, status or presence, cannot create or read another worker's consumer, cannot read `NATTER_RESULTS` for another worker, cannot publish `natter.sent.*`, cannot direct-get from `NATTER_SENT`; a forged envelope naming another worker is dropped; TLS with a CA file connects and an untrusted CA fails; seed with loose mode logs a warning; `<creds_dir>` traversal through a crafted name is impossible.
+- Design: every session and bootstrap use one seed, `<creds_dir>/natter.nk`, whatever its name or role. The server config has one nkey user with no per-subject permissions, listening on TLS. No per-identity seeds or ACLs. Loopback stays unauthenticated for development.
+- Acceptance against the shipped template, booted from that exact file: bootstrap, a worker and an orchestrator complete a task over `tls://` with the shared nkey; a wrong key is refused; an untrusted CA is refused; a seed with a trailing newline works; a group- or world-readable seed logs a warning.
 - Cheapest check: `bun test test/auth.test.ts`.
-- Worker: infra.
+- Worker: small.
 
 ### S10. Docs, instructions review, live smoke
 
 - Files: `README.md`, `src/instructions.ts`, `.claude-plugin/plugin.json` (version), `mise.toml` if needed.
 - Depends on: all.
+- Orchestrator `instructions` must say what `stale` means: heartbeats come from the server process, so a busy or quiet Claude never goes stale, and `stale` means the worker's server stopped responding. In the live check Claude guessed the worker was just waiting on a command and left the task alone.
 - Acceptance: README covers bootstrap's JetStream storage need of about 1.81 GiB, that an upgrade on a tight server needs storage raised first because `NATTER_STATE` gives up the presence subject before `NATTER_PRESENCE` is created, so a failed create leaves no stream capturing presence, launch commands, `.claude/natter.json`, allow rules with exact tool names, orchestrator lockdown, bootstrap, auth setup, research-preview limits and tested Claude Code version; smoke checklist run once on two sessions, ideally across two machines over `tls://`; a planted result telling the orchestrator to change settings is not obeyed.
 - Cheapest check: run the checklist; `mise run check`.
 - Worker: docs.
@@ -502,8 +506,8 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 ### S12. Permission-stall alert
 
-- Files: `hooks/hooks.json`, `src/hook.ts`, `src/worker.ts`, `src/protocol.ts`, `test/hook.test.ts`, `deploy/nats-server.example.conf`.
-- Depends on: S7, S9.
+- Files: `hooks/hooks.json`, `src/hook.ts`, `src/worker.ts`, `src/protocol.ts`, `test/hook.test.ts`.
+- Depends on: S7.
 - Design: a `Notification` hook with matcher `permission_prompt` runs `src/hook.ts`. The worker writes its held `task_id` to a per-session file under `${CLAUDE_PLUGIN_DATA}`, keyed by session id, because a hook gets neither the server's state nor documented access to its `env`. The hook is a short-lived process: it reads that file, connects, publishes status `waiting_permission` for the held task with the same worker credential, and exits within a bound. With no role or no held task it does nothing. It never blocks the prompt, and failure is silent to the session. The status clears on the next tool call. The attention sweep raises it once. It reports only that a prompt is waiting, not its content, because tool input can hold secrets.
 - Acceptance: hook input for a worker with a held task writes one status; no role, no held task or NATS down exits 0 within 2s with nothing written; `waiting_permission` reaches `list_tasks` and one `attention` push.
 - Live check first, before building: confirm the hook fires in a channel session, its stdin fields, and whether `NATTER_ROLE` reaches it. Docs did not settle these. If it does not fire, drop this slice and keep the run timeout as the signal.
@@ -521,15 +525,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 - Live check once: `/nats-channel:status` opens the page during a two-session run.
 - Worker: design judgment, security reviewer pass.
 
-### S14. Audit stream
-
-- Files: `src/bootstrap.ts`, `test/bootstrap.test.ts`, `deploy/nats-server.example.conf`.
-- Depends on: S9. There are no per-worker limits (3.6), so a flood can age out the trail; `max_bytes` still bounds it.
-- Design: `NATTER_AUDIT`, a stream sourcing `NATTER_TASKS`, `NATTER_RESULTS`, `NATTER_STATE`, `NATTER_PRESENCE` and `NATTER_SENT` with a `max_age` and `max_bytes`. Read only by the admin and dashboard identities: it holds every prompt and result. Status floods make it noisy, so decide at build time whether it mirrors `NATTER_STATE` at all.
-- Acceptance: traffic on all sources appears in order; workers cannot read it; a flood from one worker cannot evict another's task or result records; bootstrap reports its storage in the total.
-- Worker: infra.
-
-Order: S1, S2, then S3, S4, S5; S6 can run in parallel with S4 once S3 lands; then S7, S8, S9, S11, S12, S13, S14, and S10 last so the docs cover everything.
+Order: S1, S2, then S3, S4, S5; S6 can run in parallel with S4 once S3 lands; then S7, S8, S9, S11, S12, S13, and S10 last so the docs cover everything. An audit stream was considered and dropped as out of scope for personal use.
 
 ## 6. Verification
 
