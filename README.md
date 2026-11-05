@@ -181,7 +181,6 @@ Other attention reasons: `released` (a task was not accepted in time and will be
 - The `session_error` alert does not stop the retries: it does not fail the task or change the accept timer, so a blocked prompt can be sent again, up to 3 attempts. Whether `StopFailure` fires on a safeguard block is not yet confirmed live.
 - The permission hooks need `CLAUDE_CODE_SESSION_ID` and `HOME`. Without them the alert is not raised.
 - No real two-machine TLS run has been done. The TLS path is tested against the shipped server template on one machine.
-- The status page has not been tried in a real browser.
 - A second orchestrator session on the same account splits pushes between them. Run one.
 - There is no cancel, no file transfer and no mid-task dialogue.
 
