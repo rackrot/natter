@@ -16,13 +16,15 @@ import {
   PRESENCE_SUBJECTS,
   RESULT_SUBJECTS,
   RESULTS_STREAM_NAME,
+  SENT_STREAM_NAME,
+  SENT_SUBJECTS,
   STATE_STREAM_NAME,
   STATUS_SUBJECTS,
   TASK_SUBJECTS,
   TASKS_STREAM_NAME,
 } from './protocol'
 
-// Admin-only: creates or reconciles the three streams (plan 3.3). Workers
+// Admin-only: creates or reconciles the four streams (plan 3.3). Workers
 // never create streams. Standalone command, not imported by src/server.ts.
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -30,6 +32,7 @@ const MIB = 1024 * 1024
 const TASKS_MAX_BYTES = 256 * MIB
 const RESULTS_MAX_BYTES = 1024 * MIB
 const STATE_MAX_BYTES = 256 * MIB
+const SENT_MAX_BYTES = 256 * MIB
 
 /** The settings this command owns; everything else is left at server defaults. */
 export type ManagedStream = Pick<
@@ -99,10 +102,30 @@ export const STATE_STREAM: ManagedStream = {
   max_bytes: STATE_MAX_BYTES,
 }
 
+// The orchestrator's record of each send, what every result is checked against
+// (plan 3.6). Only the orchestrator can write it, so nothing here is evicted to
+// make room, and it outlives NATTER_RESULTS. Never drop it: every result still
+// in the durable would then be terminated for having no record.
+export const SENT_STREAM: ManagedStream = {
+  name: SENT_STREAM_NAME,
+  subjects: [SENT_SUBJECTS],
+  retention: RetentionPolicy.Limits,
+  storage: StorageType.File,
+  max_age: nanos(30 * DAY_MS),
+  max_msgs_per_subject: 1,
+  discard: DiscardPolicy.New,
+  discard_new_per_subject: true,
+  duplicate_window: nanos(2 * 60 * 1000),
+  allow_direct: true,
+  max_msg_size: MAX_MESSAGE_BYTES,
+  max_bytes: SENT_MAX_BYTES,
+}
+
 export const STREAMS = Object.freeze([
   TASKS_STREAM,
   RESULTS_STREAM,
   STATE_STREAM,
+  SENT_STREAM,
 ])
 for (const stream of STREAMS) {
   Object.freeze(stream.subjects)

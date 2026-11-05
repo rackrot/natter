@@ -389,19 +389,21 @@ export function createWorker({
   ): Promise<Stored> {
     const subject = resultSubject(config.name, taskId)
     try {
-      const ack = await onStream(RESULTS_STREAM_NAME, () =>
+      // No Nats-Msg-Id. Dedupe spans the stream and ACLs cannot reach headers, so
+      // any worker could claim one and have this store answered as a duplicate.
+      // The per-subject limit already makes a repeat safe.
+      await onStream(RESULTS_STREAM_NAME, () =>
         jetstream(nc).publish(subject, bytes, {
-          msgID: taskId,
           expect: { lastSubjectSequence: 0 },
         }),
       )
-      if (!ack.duplicate) return 'written'
+      return 'written'
     } catch (err) {
       if (!isApiError(err, JetStreamApiCodes.StreamWrongLastSequence)) throw err
     }
-    // Also where this session's own retry lands after a lost PubAck. Nats-Msg-Id
-    // is the task_id for everyone, so only `instance` says whose result it is,
-    // and a `reason` marks one the plugin wrote, not this finish_task.
+    // Also where this session's own retry lands after a lost PubAck. Only
+    // `instance` says whose result it is, and a `reason` marks one the plugin
+    // wrote, not this finish_task.
     const stored = await storedResult(nc, taskId)
     if (!stored) throw new Error('the stored result is gone, call again')
     const parsed = parseMessage(subject, stored.data)
@@ -495,9 +497,9 @@ export function createWorker({
 
   /**
    * Attempts count pushes to Claude, not deliveries: the stored `delivered`
-   * status written before each push is the record. Only no status, or the
-   * orchestrator's `queued`, means nothing was pushed yet. A `released` push
-   * reached nobody, so it costs no attempt; a lost `released` overcounts by one.
+   * status written before each push is the record. Only no status means nothing
+   * was pushed yet. A `released` push reached nobody, so it costs no attempt; a
+   * lost `released` overcounts by one.
    * Anything else without a usable attempt falls back to `deliveryCount`, which
    * can overcount but keeps `max_attempts` a real bound.
    */
@@ -513,7 +515,6 @@ export function createWorker({
       const parsed = parseMessage(subject, stored.data)
       if (parsed.ok && parsed.envelope.type === 'status') {
         const { state, attempt } = parsed.envelope
-        if (state === 'queued') return 1
         if (attempt !== undefined) {
           return state === 'released' ? attempt : attempt + 1
         }

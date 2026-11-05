@@ -20,6 +20,7 @@ import {
 import {
   bootstrapStreams,
   RESULTS_STREAM,
+  SENT_STREAM,
   STATE_STREAM,
   STREAMS,
   TASKS_STREAM,
@@ -28,6 +29,7 @@ import {
   MAX_MESSAGE_BYTES,
   presenceSubject,
   resultSubject,
+  sentSubject,
   taskSubject,
 } from '../src/protocol'
 import { startNats, type TestNats, until } from './support/nats'
@@ -115,7 +117,6 @@ const recordResult = async () => {
   const taskId = nuid.next()
   const subject = resultSubject('alpha', taskId)
   const { seq } = await jetstream(nc).publish(subject, 'first', {
-    msgID: taskId,
     expect: { lastSubjectSequence: 0 },
   })
   return { subject, seq }
@@ -138,12 +139,13 @@ afterAll(async () => {
   await nats?.cleanup()
 })
 
-test('creates the three streams with the plan settings', async () => {
+test('creates the four streams with the plan settings', async () => {
   const outcomes = await bootstrapStreams(jsm)
   expect(outcomes.map((o) => [o.name, o.action])).toEqual([
     ['NATTER_TASKS', 'created'],
     ['NATTER_RESULTS', 'created'],
     ['NATTER_STATE', 'created'],
+    ['NATTER_SENT', 'created'],
   ])
 
   const day = 24 * 60 * 60 * 1000
@@ -188,6 +190,64 @@ test('creates the three streams with the plan settings', async () => {
     allow_direct: true,
     max_bytes: 256 * MIB,
   })
+  expect(await managed(SENT_STREAM)).toEqual({
+    ...base,
+    name: 'NATTER_SENT',
+    subjects: ['natter.sent.*'],
+    retention: 'limits',
+    max_age: nanos(30 * day),
+    max_msgs_per_subject: 1,
+    discard: 'new',
+    discard_new_per_subject: true,
+    allow_direct: true,
+    max_bytes: 256 * MIB,
+  })
+})
+
+test('a record cannot be replaced, and a retry of it does not duplicate', async () => {
+  const js = jetstream(nc)
+  const taskId = nuid.next()
+  const subject = sentSubject(taskId)
+  const first = await js.publish(subject, 'first', { msgID: taskId })
+
+  expect(
+    (await js.publish(subject, 'first', { msgID: taskId })).duplicate,
+  ).toBe(true)
+  expect(await apiCode(js.publish(subject, 'second'))).toBe(STREAM_STORE_FAILED)
+  const stored = await jsm.direct.getMessage('NATTER_SENT', {
+    last_by_subj: subject,
+  })
+  expect(stored?.seq).toBe(first.seq)
+  expect(stored?.string()).toBe('first')
+})
+
+test('a record refuses a body over the message limit', async () => {
+  const js = jetstream(nc)
+  await expect(
+    js.publish(sentSubject(nuid.next()), new Uint8Array(MAX_MESSAGE_BYTES + 1)),
+  ).rejects.toThrow()
+})
+
+test('a run keeps the records of a NATTER_SENT that has drifted', async () => {
+  await onFreshServer(async (_server, conn, manager) => {
+    await manager.streams.add({ ...SENT_STREAM, max_bytes: 512 * MIB })
+    await jetstream(conn).publish(sentSubject(nuid.next()), 'kept')
+
+    const outcomes = await bootstrapStreams(manager)
+
+    expect(outcomes.find((o) => o.name === 'NATTER_SENT')).toMatchObject({
+      action: 'updated',
+      changed: ['max_bytes'],
+      messages: { before: 1, after: 1 },
+    })
+  })
+})
+
+test('a nats-server that cannot start says why', async () => {
+  const missing = join(tmpdir(), 'natter-no-such-cert.pem')
+  await expect(
+    startNats({ tls: { certFile: missing, keyFile: missing } }),
+  ).rejects.toThrow(missing)
 })
 
 test('the stream definitions cannot be changed at runtime', () => {
@@ -205,6 +265,7 @@ test('a second run changes nothing and keeps stored messages', async () => {
   const outcomes = await bootstrapStreams(jsm)
 
   expect(outcomes.map((o) => o.action)).toEqual([
+    'unchanged',
     'unchanged',
     'unchanged',
     'unchanged',
@@ -273,6 +334,7 @@ test('a drifted stream is updated back without losing messages', async () => {
       0,
       0,
     ],
+    ['NATTER_SENT', 'unchanged', [], undefined, undefined],
   ])
   for (const stream of STREAMS) {
     expect(await managed(stream)).toEqual({ ...stream })
@@ -395,9 +457,7 @@ test('a message over max_msg_size is rejected, one at the limit is stored', asyn
 test('the first result for a task wins', async () => {
   const { subject, seq } = await recordResult()
 
-  // A different msgID so the loss is the sequence check, not dedupe.
   const loser = jetstream(nc).publish(subject, 'second', {
-    msgID: nuid.next(),
     expect: { lastSubjectSequence: 0 },
   })
 

@@ -20,15 +20,15 @@ export interface TestNats {
   cleanup(): Promise<void>
 }
 
-async function freePort(): Promise<number> {
-  const probe = Bun.listen({
-    hostname: '127.0.0.1',
-    port: 0,
-    socket: { data() {} },
-  })
-  const { port } = probe
-  probe.stop(true)
-  return port
+const openProbe = () =>
+  Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } })
+
+/** Two free ports. Both probes stay open until both are read, so they differ. */
+function freePorts(): [number, number] {
+  const probes = [openProbe(), openProbe()] as const
+  const ports: [number, number] = [probes[0].port, probes[1].port]
+  for (const probe of probes) probe.stop(true)
+  return ports
 }
 
 // Below Bun's 5s default test timeout, so a slow condition fails its own test.
@@ -53,9 +53,9 @@ export async function startNats(
     tls?: { certFile: string; keyFile: string }
   } = {},
 ): Promise<TestNats> {
-  const port = await freePort()
-  const monitorPort = await freePort()
+  const [port, monitorPort] = freePorts()
   const storeDir = await mkdtemp(join(tmpdir(), 'natter-nats-'))
+  const stderrPath = join(storeDir, 'stderr.log')
   let proc: Bun.Subprocess | undefined
   // Bun's timeout kill reaches this at once, while a killed nats-server keeps
   // answering, /healthz included, for tens of ms: no probe of it can tell.
@@ -77,26 +77,30 @@ export async function startNats(
     args.push('--tlskey', opts.tls.keyFile)
   }
 
-  const ready = async () => {
+  const startFailure = async (what: string) =>
+    new Error(`nats-server ${what}: ${await Bun.file(stderrPath).text()}`)
+  const ready = async (server: Bun.Subprocess) => {
     for (let attempt = 0; ; attempt++) {
       try {
         const res = await fetch(`http://127.0.0.1:${monitorPort}/healthz`)
         if (res.ok) return
       } catch {}
-      if (attempt >= 100) throw new Error('nats-server did not become ready')
-      await Bun.sleep(50)
+      if (attempt >= 100) throw await startFailure('did not become ready')
+      const code = await Promise.race([server.exited, Bun.sleep(50)])
+      if (code !== undefined) throw await startFailure(`exited with ${code}`)
     }
   }
   const start = async () => {
-    proc = Bun.spawn(['nats-server', ...args], {
+    const server = Bun.spawn(['nats-server', ...args], {
       stdout: 'ignore',
-      stderr: 'ignore',
+      stderr: Bun.file(stderrPath),
     })
+    proc = server
     canary = Bun.spawn(['sleep', '86400'], {
       stdout: 'ignore',
       stderr: 'ignore',
     })
-    await ready()
+    await ready(server)
   }
   const stop = async () => {
     canary?.kill()

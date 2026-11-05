@@ -7,6 +7,7 @@ import {
 import { resolveConfig, SHUTDOWN_DEADLINE_MS } from './config'
 import { startConnection } from './connection'
 import { instructionsFor } from './instructions'
+import { createOrchestrator, ORCHESTRATOR_TOOLS } from './orchestrator'
 import { createWorker, WORKER_TOOLS } from './worker'
 
 // stdout belongs to MCP; everything else goes to stderr.
@@ -30,9 +31,9 @@ const mcp = new Server(
 
 // Connecting never blocks; the handlers below need these before MCP is up.
 const connection = config ? startConnection(config, log) : undefined
-const worker =
-  config?.role === 'worker' && connection
-    ? createWorker({
+const role =
+  config && connection
+    ? (config.role === 'worker' ? createWorker : createOrchestrator)({
         config,
         connection,
         push: (content, meta) =>
@@ -44,15 +45,16 @@ const worker =
         env: process.env,
       })
     : undefined
+const tools = config?.role === 'worker' ? WORKER_TOOLS : ORCHESTRATOR_TOOLS
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: worker ? WORKER_TOOLS : [],
+  tools: role ? tools : [],
 }))
-if (worker) {
+if (role) {
   mcp.setRequestHandler(CallToolRequestSchema, ({ params }) =>
-    worker.callTool(params.name, params.arguments),
+    role.callTool(params.name, params.arguments),
   )
-  mcp.oninitialized = () => worker.start()
+  mcp.oninitialized = () => role.start()
 }
 
 await mcp.connect(new StdioServerTransport())
@@ -65,7 +67,7 @@ function shutdown(): void {
   shuttingDown = true
   log('shutting down')
   setTimeout(() => process.exit(0), SHUTDOWN_DEADLINE_MS)
-  void Promise.resolve(worker?.stop())
+  void Promise.resolve(role?.stop())
     .then(() => connection?.close())
     .catch((err: unknown) => log(`drain failed: ${err}`))
     .finally(() => process.exit(0))

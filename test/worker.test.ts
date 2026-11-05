@@ -206,7 +206,6 @@ const recordResult = async (
   })
   if (!encoded.ok) throw new Error(encoded.issues.join('; '))
   return js.publish(resultSubject(worker, task_id), encoded.bytes, {
-    msgID: task_id,
     expect: { lastSubjectSequence: 0 },
   })
 }
@@ -613,7 +612,6 @@ test('a plugin-written result under this instance is not taken for this finish_t
 
 test.each([
   ['no status', undefined, '1'],
-  ['a queued status', { state: 'queued' }, '1'],
   ['a status from attempt 2', { state: 'delivered', attempt: 2 }, '3'],
   ['a delivered status with no attempt', { state: 'delivered' }, '4'],
 ] as const)(
@@ -1045,27 +1043,6 @@ test('a failed lookup after 10071 returns isError and keeps the task', async () 
   })
 })
 
-test('a dedupe ack with no stored result returns isError and keeps the task', async () => {
-  const name = freshName()
-  const task = await publishTask(makeTask(name))
-  const s = await startWorkerSession(name)
-  await pushCount(s, 1)
-  await statusIs(name, task.task_id, 'delivered')
-  const instance = (await statusOf(name, task.task_id))?.instance as string
-  const { seq } = await recordResult(name, task.task_id, instance)
-  await jsm.streams.deleteMessage('NATTER_RESULTS', seq)
-
-  const res = await finish(s, task.task_id)
-
-  expect(res.isError).toBe(true)
-  expect(await storedResult(name, task.task_id)).toBeUndefined()
-  expect(await queued(name)).toBe(1)
-  expect((await consumerOf(name)).num_ack_pending).toBe(1)
-  expect(
-    (await callTool(s, 'update_task', { task_id: task.task_id })).isError,
-  ).toBeUndefined()
-})
-
 test('a missing NATTER_RESULTS is survived with the task held', async () => {
   await onFreshServer(async (server, js, manager) => {
     const name = freshName()
@@ -1265,7 +1242,9 @@ test('sessions outside the worker role have no worker tools', async () => {
   const name = freshName()
   const worker = await startWorkerSession(name)
 
-  expect((await orchestrator.client.listTools()).tools).toEqual([])
+  expect(
+    (await orchestrator.client.listTools()).tools.map((t) => t.name),
+  ).not.toContain('finish_task')
   expect((await inert.client.listTools()).tools).toEqual([])
   await expect(finish(orchestrator, nuid.next())).rejects.toThrow()
   await expect(finish(inert, nuid.next())).rejects.toThrow()

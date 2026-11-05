@@ -9,11 +9,35 @@ export const MAX_MESSAGE_BYTES = 128 * 1024
 export const TASKS_STREAM_NAME = 'NATTER_TASKS'
 export const RESULTS_STREAM_NAME = 'NATTER_RESULTS'
 export const STATE_STREAM_NAME = 'NATTER_STATE'
+export const SENT_STREAM_NAME = 'NATTER_SENT'
 const MAX_JSON_DEPTH = 32
 const MAX_ARTIFACTS = 32
 
 /** A nuid: 22 base62 characters. Also a safe subject token. */
 export const NUID_PATTERN = /^[0-9A-Za-z]{22}$/
+
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+// The largest multiple of 62 a byte can hold; rejecting above it keeps the
+// characters uniform.
+const BASE62_BYTES = 248
+const TASK_ID_LENGTH = 22
+
+/**
+ * A nuid-shaped id from the system CSPRNG. A nuid's prefix is shared and its
+ * tail counts up, so a few of them give away the next. Hardening only: the
+ * record, not the secrecy of the id, is what makes a result trusted.
+ */
+export function mintTaskId(): string {
+  let id = ''
+  while (id.length < TASK_ID_LENGTH) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(32))) {
+      if (byte < BASE62_BYTES && id.length < TASK_ID_LENGTH) {
+        id += BASE62[byte % BASE62.length]
+      }
+    }
+  }
+  return id
+}
 
 export class WireError extends Error {}
 
@@ -30,11 +54,12 @@ const nuidToken = (value: string, what: string): string => {
 
 export const taskSubject = (worker: string) =>
   `natter.task.${nameToken(worker, 'worker')}`
-/** Wildcard forms of the four subjects, for stream capture and ACLs. */
+/** Wildcard forms of the five subjects, for stream capture and ACLs. */
 export const TASK_SUBJECTS = 'natter.task.*'
 export const RESULT_SUBJECTS = 'natter.result.*.*'
 export const STATUS_SUBJECTS = 'natter.status.*.*'
 export const PRESENCE_SUBJECTS = 'natter.presence.*'
+export const SENT_SUBJECTS = 'natter.sent.*'
 
 export const presenceSubject = (worker: string) =>
   `natter.presence.${nameToken(worker, 'worker')}`
@@ -42,15 +67,26 @@ export const resultSubject = (worker: string, taskId: string) =>
   `natter.result.${nameToken(worker, 'worker')}.${nuidToken(taskId, 'task_id')}`
 export const statusSubject = (worker: string, taskId: string) =>
   `natter.status.${nameToken(worker, 'worker')}.${nuidToken(taskId, 'task_id')}`
+export const sentSubject = (taskId: string) =>
+  `natter.sent.${nuidToken(taskId, 'task_id')}`
 
 export type SubjectInfo =
   | { kind: 'task' | 'presence'; worker: string }
   | { kind: 'result' | 'status'; worker: string; taskId: string }
+  | { kind: 'sent'; taskId: string }
 
-/** Returns undefined for any subject that is not exactly one of the four. */
+/** Returns undefined for any subject that is not exactly one of the five. */
 export function parseSubject(subject: string): SubjectInfo | undefined {
   const [root, kind, worker, taskId, ...rest] = subject.split('.')
   if (root !== 'natter' || rest.length > 0) return undefined
+  if (kind === 'sent') {
+    // The second token is the id here: a record belongs to no worker's subject.
+    return worker !== undefined &&
+      NUID_PATTERN.test(worker) &&
+      taskId === undefined
+      ? { kind, taskId: worker }
+      : undefined
+  }
   if (worker === undefined || !NAME_PATTERN.test(worker)) return undefined
   if (kind === 'task' || kind === 'presence') {
     return taskId === undefined ? { kind, worker } : undefined
@@ -180,6 +216,21 @@ export const TaskSchema = z.object({
   depth: count,
 })
 
+// The orchestrator's own record of a send. Only its credential can write this
+// subject, so it is what every result is checked against (plan 3.6).
+export const SentSchema = TaskSchema.pick({
+  v: true,
+  task_id: true,
+  to: true,
+  title: true,
+  created_at: true,
+  root_task_id: true,
+  parent_task_id: true,
+  depth: true,
+  timeout_s: true,
+  queue_ttl_s: true,
+}).extend({ type: z.literal('sent') })
+
 export const ResultSchema = z.object({
   v: z.literal(PROTOCOL_VERSION),
   type: z.literal('result'),
@@ -202,14 +253,7 @@ export const StatusSchema = z.object({
   worker: name,
   title: bounded(120, 1),
   created_at: timestamp,
-  state: z.enum([
-    'queued',
-    'delivered',
-    'accepted',
-    'stalled',
-    'released',
-    'finished',
-  ]),
+  state: z.enum(['delivered', 'accepted', 'stalled', 'released', 'finished']),
   instance: nuid.optional(),
   attempt: positive.optional(),
   note: bounded(512).optional(),
@@ -234,14 +278,16 @@ export const PresenceSchema = z.object({
 })
 
 export type Task = z.infer<typeof TaskSchema>
+export type Sent = z.infer<typeof SentSchema>
 export type Result = z.infer<typeof ResultSchema>
 export type Status = z.infer<typeof StatusSchema>
 export type Presence = z.infer<typeof PresenceSchema>
-export type Envelope = Task | Result | Status | Presence
+export type Envelope = Task | Sent | Result | Status | Presence
 export type EnvelopeType = Envelope['type']
 
 const schemas = {
   task: TaskSchema,
+  sent: SentSchema,
   result: ResultSchema,
   status: StatusSchema,
   presence: PresenceSchema,
@@ -321,6 +367,9 @@ const fail = (
 function mismatches(subject: SubjectInfo, e: Envelope): boolean {
   if (e.type === 'task')
     return subject.kind !== 'task' || e.to !== subject.worker
+  if (e.type === 'sent')
+    return subject.kind !== 'sent' || e.task_id !== subject.taskId
+  if (subject.kind === 'sent') return true
   if (e.type !== subject.kind || e.worker !== subject.worker) return true
   return 'taskId' in subject && 'task_id' in e && e.task_id !== subject.taskId
 }
@@ -404,6 +453,23 @@ export function sanitizeContent(text: string): string {
     .replace(ESC_SEQUENCE, '')
     .replace(CONTROLS, '')
     .replace(INVISIBLE, '')
+}
+
+/**
+ * `sanitizeContent` for every string in a parsed JSON value, keys included.
+ * Keys that become equal collapse, last one wins. `parseMessage` bounds the
+ * depth, and `fromEntries` keeps a key that sanitizes to `__proto__` inert.
+ */
+export function sanitizeJson(value: unknown): unknown {
+  if (typeof value === 'string') return sanitizeContent(value)
+  if (Array.isArray(value)) return value.map(sanitizeJson)
+  if (typeof value !== 'object' || value === null) return value
+  return Object.fromEntries(
+    Object.entries(value).map(([k, v]) => [
+      sanitizeContent(k),
+      sanitizeJson(v),
+    ]),
+  )
 }
 
 const META_KINDS = ['task', 'result', 'task_closed', 'attention'] as const

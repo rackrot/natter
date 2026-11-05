@@ -7,6 +7,9 @@ export const MAX_DESCRIPTION_BYTES = 512
 export const MAX_TIMEOUT_S = 86400
 export const DEFAULT_NATS_URL = 'nats://127.0.0.1:4222'
 export const DEFAULT_CREDS_DIR = '~/.config/natter'
+export const DEFAULT_TIMEOUT_S = 3600
+export const DEFAULT_QUEUE_TTL_S = 86400
+export const DEFAULT_MAX_ATTEMPTS = 3
 const ADMIN_NAME = 'admin'
 // Shutdown must finish well inside the 3s the plugin promises on stdin close.
 export const SHUTDOWN_DEADLINE_MS = 2000

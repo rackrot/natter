@@ -52,11 +52,12 @@ Spikes were run in `/tmp` against the repo's `node_modules`, Bun 1.4.4 and `nats
 | Subject | Written by | Stored in | Purpose |
 | --- | --- | --- | --- |
 | `natter.task.<worker>` | orchestrator | `NATTER_TASKS` | queued tasks |
+| `natter.sent.<task_id>` | orchestrator only | `NATTER_SENT` | the record of a send: what every result is checked against (3.6) |
 | `natter.result.<worker>.<task_id>` | worker | `NATTER_RESULTS` | one terminal result per task |
-| `natter.status.<worker>.<task_id>` | both | `NATTER_STATE` (core publish, stream captures; `delivered` is a JetStream publish) | latest task state, the ledger |
+| `natter.status.<worker>.<task_id>` | worker | `NATTER_STATE` (core publish, stream captures; `delivered` is a JetStream publish) | latest task state: progress only, never proof of anything |
 | `natter.presence.<worker>` | worker | `NATTER_STATE` (core publish, stream captures) | latest heartbeat |
 
-`<worker>` matches `^[a-z0-9][a-z0-9_-]{0,63}$`. `<task_id>` is a nuid. The subject token is the identity: ACLs bind it to a credential, and a receiver drops any envelope whose `worker` or `to` disagrees with the subject.
+`<worker>` matches `^[a-z0-9][a-z0-9_-]{0,63}$`. `<task_id>` has the form of a nuid (22 base62 characters) but comes from the system CSPRNG. The subject token is the identity: ACLs bind it to a credential, and a receiver drops any envelope whose `worker` or `to` disagrees with the subject.
 
 Reserved session names, because a name also selects the seed file: `admin` for every role, `orchestrator` for workers. Bootstrap gets its identity from `adminConfig` and never goes through session resolution.
 
@@ -107,6 +108,10 @@ Task = {
   timeout_s, queue_ttl_s, max_attempts,
   root_task_id, parent_task_id?, depth,
 }
+Sent = {
+  v: 1, type: 'sent', task_id, to, title, created_at,
+  root_task_id, parent_task_id?, depth, timeout_s, queue_ttl_s,
+}
 Result = {
   v: 1, type: 'result', task_id, worker, instance, attempt,
   outcome: 'succeeded' | 'failed' | 'blocked',
@@ -116,7 +121,7 @@ Result = {
 }
 Status = {
   v: 1, type: 'status', task_id, worker, title, created_at,
-  state: 'queued' | 'delivered' | 'accepted' | 'stalled' | 'released' | 'finished',
+  state: 'delivered' | 'accepted' | 'stalled' | 'released' | 'finished',
   instance?, attempt?, note?, depth, timeout_s, queue_ttl_s,
 }
 Presence = {
@@ -129,7 +134,7 @@ Presence = {
 
 **Versioning.** `v` is an integer major. Additive changes keep `v`. A breaking change bumps it. A worker that receives an unknown `v` publishes `failed`/`invalid_task` if `task_id` parses, then calls `term()`.
 
-**Correlation.** `task_id` is a nuid minted by the orchestrator and is also the `Nats-Msg-Id`. `root_task_id`, `parent_task_id` and `depth` link follow-ups. `instance` is a nuid per server process.
+**Correlation.** `task_id` is minted by the orchestrator from the system CSPRNG and is also the `Nats-Msg-Id` of the task and the record, which only the orchestrator publishes. A result carries no `Nats-Msg-Id` (3.3, 3.6). A real nuid is not used: four of them give away the increment, and a review pre-squatted a real id that way. This is hardening only, because the id is carried in the clear and is not a secret (3.6). `root_task_id`, `parent_task_id` and `depth` link follow-ups. `instance` is a nuid per server process.
 
 **Size limits**, measured in UTF-8 bytes. The tool rejects with `isError` telling Claude what to shorten. The broker enforces the outer limit.
 
@@ -153,6 +158,7 @@ Rejected: protobuf or msgpack (`nats sub` readability matters for the plain-subj
 | --- | --- | --- | --- |
 | task | JetStream publish, `NATTER_TASKS` | worker offline, restart | workqueue, file, `max_age` 7d, `max_msgs_per_subject` 16, `max_bytes` 256 MiB, `discard: new`, `discard_new_per_subject`, `duplicate_window` 2m |
 | result | JetStream publish, `NATTER_RESULTS` | orchestrator offline, restart | limits, file, `max_age` 14d, `max_msgs_per_subject` 1, `max_bytes` 1 GiB, `discard: new`, `discard_new_per_subject`, `allow_direct` |
+| sent record | JetStream publish, `NATTER_SENT`, `Nats-Msg-Id = task_id`, stored before the task is published | everything: it is the only proof a task was sent, so it outlives results | limits, file, `max_age` 30d, `max_msgs_per_subject` 1, `max_bytes` 256 MiB, `max_msg_size` 128 KiB, `discard: new`, `discard_new_per_subject`, `duplicate_window` 2m, `allow_direct` |
 | status `delivered` | JetStream publish, `NATTER_STATE` | session loss, because it is the attempt record: losing one lets `max_attempts` go unenforced | as the row below |
 | other status, presence | core publish into `NATTER_STATE` | nothing; losing one is fine | limits, file, `max_age` 14d, `max_msgs_per_subject` 1, `max_bytes` 256 MiB, `max_msg_size` 128 KiB, `allow_direct` |
 
@@ -164,12 +170,12 @@ Worker consumer `task-<name>`: pull, explicit ack, filter `natter.task.<name>`, 
 2. Validate. On failure publish `failed`/`invalid_task` where possible and `term()`.
 3. Direct-get `natter.result.<me>.<task_id>`. If it exists, `ack()` and stop. This closes the crash window between result publish and ack.
 4. If `now - stream timestamp > queue_ttl_s`, publish `failed`/`expired_in_queue` and `term()`.
-5. Direct-get the latest `natter.status.<me>.<task_id>`. `attempt` is 1 if there is none or it is `queued`, its `attempt` if it is `released`, otherwise its `attempt + 1`. A status with no `attempt`, one that fails to parse, or a failed read uses `deliveryCount`. If `attempt > max_attempts`, publish `failed`/`attempts_exhausted` and `term()`.
+5. Direct-get the latest `natter.status.<me>.<task_id>`. `attempt` is 1 if there is none, its `attempt` if it is `released`, otherwise its `attempt + 1`. A status with no `attempt`, one that fails to parse, or a failed read uses `deliveryCount`. If `attempt > max_attempts`, publish `failed`/`attempts_exhausted` and `term()`.
 6. Publish status `delivered` with `js.publish` and wait for the PubAck. If that fails, keep retrying with backoff under `working()` and do not push. Then push to Claude with `attempt` and start timers: `working()` every 30s and the accept timer.
 7. `update_task` is the delivery receipt. The first call moves the task to `accepted`, stops the accept timer and starts the run timer. A `finish_task` that arrives first, even a rejected one, does the same with the timers but writes no status.
-8. `finish_task` publishes the result with `lastSubjectSequence: 0` and `Nats-Msg-Id = task_id`, waits for the PubAck, publishes status `finished`, then `ackAck()`, then pulls the next task. On error 10071, direct-get the stored result and compare its `instance`. Equal means this session's own retry after a lost PubAck, so continue as success. Different means another session won, so return "already recorded". The `Nats-Msg-Id` header cannot tell these apart, because it is the `task_id` for every session. A 10077 or a full stream returns `isError` and keeps the task.
+8. `finish_task` publishes the result with `lastSubjectSequence: 0` and no `Nats-Msg-Id`, waits for the PubAck, publishes status `finished`, then `ackAck()`, then pulls the next task. On error 10071, direct-get the stored result and compare its `instance`. Equal means this session's own retry after a lost PubAck, so continue as success. Different means another session won, so return "already recorded". A result has no `Nats-Msg-Id` because dedupe spans the stream and no ACL can reach a header: any worker could claim an id and have this store answered as a duplicate, with nothing stored. The per-subject limit already makes a repeat safe. A 10077 or a full stream returns `isError` and keeps the task.
 
-**Terminal results the plugin writes.** `attempts_exhausted`, `expired_in_queue` and `timeout` are stored first, then status `finished` is core-published, then `term()`. If the store fails, the task stays held under `working()` and the store retries; there is no `term()` without a result, and a stop during the retry leaves the task to return after `ack_wait`. The row is a hint only: `invalid_task` writes none because the title may be missing, and core publishes can be lost. So S6 and S7 must join on results and treat a stored result as terminal, whatever the row says.
+**Terminal results the plugin writes.** `attempts_exhausted`, `expired_in_queue` and `timeout` are stored first, then status `finished` is core-published, then `term()`. If the store fails, the task stays held under `working()` and the store retries; there is no `term()` without a result, and a stop during the retry leaves the task to return after `ack_wait`. The row is a hint only: `invalid_task` writes none because the title may be missing, and core publishes can be lost. So S6 and S7 start from the record, join on the exact result subject it names, and treat a trusted result as terminal whatever the row says. A `finished` row with no trusted result closes nothing.
 
 **No delivery ack from Claude.** `update_task` stands in for it. If it does not arrive within `accept_timeout_s` (600), then either the session is deaf (no channel loaded) or it is too busy, and the server:
 
@@ -185,7 +191,7 @@ A later `update_task` or `finish_task` for a released task returns `isError` ("r
 
 **Redelivery and side effects.** Attempts count pushes to Claude, not JetStream deliveries, and the stored `delivered` status published before each push is what records one, so nothing is pushed unless that record is stored. A delivery that reaches no record (a lost result lookup, a standby taking over, a broker outage) costs no attempt. A stop or failed push between the `delivered` store and the push does cost one, which is the safe direction.
 
-A release of an unaccepted task costs no attempt: the next delivery reuses the `attempt` of a `released` status, so deaf sessions cannot exhaust a task nobody worked on. The bound on a permanently deaf worker is then `queue_ttl_s` (`expired_in_queue`) plus the attention sweep on `released`. TTL fires at the next delivery, so a task nobody pulls can outlive it, up to stream `max_age`, when the broker deletes it with no result. `list_tasks` and `get_result` must report an open row whose task is gone from `NATTER_TASKS` as lost, not as still queued. `released` is a core publish, so a lost one overcounts by one, the safe direction. A clean exit before acceptance writes no `released`, so it still costs an attempt.
+A release of an unaccepted task costs no attempt: the next delivery reuses the `attempt` of a `released` status, so deaf sessions cannot exhaust a task nobody worked on. The bound on a permanently deaf worker is then `queue_ttl_s` (`expired_in_queue`) plus the attention sweep on `released`. TTL fires at the next delivery, so a task nobody pulls can outlive it, up to stream `max_age`, when the broker deletes it with no result. `list_tasks` and `get_result` must report a recorded task with no trusted result that is gone from `NATTER_TASKS` as lost, not as still queued. A task the broker refused at publish has a record and no queue entry, so it reads the same way. A trusted subject holding a result that cannot be parsed adds `note: 'result unreadable'` to `lost`. `released` is a core publish, so a lost one overcounts by one, the safe direction. A clean exit before acceptance writes no `released`, so it still costs an attempt.
 
 When the status cannot give an attempt, `deliveryCount` stands in: it can overcount, but it keeps `max_attempts` a real bound. Known and accepted: a zombie session can overwrite the counter with its older attempt. Its `update_task` undercounts by one, bounded by the run timeout. Its accept timer's `released` write undercounts by two, because a `released` attempt is reused, and it fires at most once per push; the `nak` that follows can also move the task from the session holding it, which step 1 and first-result-wins absorb. A new session seeing `attempt > 1` is told to inspect repo state first, because the previous attempt may have changed things; a released task keeps its attempt and so carries no such hint, because nothing accepted it. `max_attempts: 1` means no retry after a lost session; it fails with `attempts_exhausted`.
 
@@ -193,11 +199,11 @@ When the status cannot give an attempt, `deliveryCount` stands in: it can overco
 
 | Duplicate source | Guard |
 | --- | --- |
-| orchestrator republishes after a lost PubAck | `Nats-Msg-Id` within 2m; `send_task` retries with the same `task_id` |
+| orchestrator republishes after a lost PubAck | `Nats-Msg-Id` within 2m; `send_task` retries the task with the same `task_id`. The record is stored once, before the task, and a failed record stops the send |
 | two sessions both finish a task (sleep, redelivery) | first result wins, enforced by the stream (`discard: new` per subject) as well as `lastSubjectSequence: 0`; on 10071 compare `instance` as in step 8; a loser's tool call returns "already recorded" |
 | crash between result and ack | step 3 direct-get |
 
-**Orchestrator results.** Durable `results`, filter `natter.result.*.*`, `max_ack_pending` 8, ack after the notification is written to the transport. Results are never lost by this: the stream keeps them for 14d and `list_tasks` plus `get_result` read them. A fresh orchestrator session has no memory anyway, so its recovery path is those tools, not a redelivered push.
+**Orchestrator results.** Durable `results`, filter `natter.result.*.*`, `max_ack_pending` 8, ack after the notification is written to the transport. Each result passes the push gate of 3.6 first, ahead of S8's push limiter: a failed read of the record, a missing stream included, leaves it unacked; no record or a mismatch gets `term()`, a log of worker and id, and no push. Results are never lost by this: the stream keeps them for 14d and `list_tasks` plus `get_result` read the trusted ones. A fresh orchestrator session has no memory anyway, so its recovery path is those tools, not a redelivered push.
 
 The push carries `outcome`, `summary` and `data_bytes`. `get_result` returns `data` and `artifacts`, so a large payload costs context only when needed.
 
@@ -229,10 +235,10 @@ Orchestrator, 4 tools:
 
 | Tool | Args | Effect |
 | --- | --- | --- |
-| `send_task` | `to`, `title`, `prompt`, `timeout_s?`, `max_attempts?`, `parent_task_id?` | Returns `task_id` and the worker's current state. Rejects a worker with no presence record, a full queue, and rate or depth limits |
+| `send_task` | `to`, `title`, `prompt`, `timeout_s?`, `max_attempts?`, `parent_task_id?` | Stores the record, then the task. Returns `task_id` and the worker's current state. Rejects a worker with no presence record, a full queue, a parent with no record, and rate or depth limits. `root_task_id` and `depth` come from the parent's record |
 | `list_workers` | none | Name, repo, host, description, state, `stale`, age |
-| `list_tasks` | `open_only?` | Ledger from `natter.status.*.*`, at most 200 rows, newest first |
-| `get_result` | `task_id` | Full result, or the current state if unfinished |
+| `list_tasks` | `open_only?` | Walks `NATTER_SENT` down from the `last_seq` read at the start, newest first by stream sequence, at most 200 rows and 2000 records scanned, reading `NATTER_TASKS` once per call. `open_only` filters after the join. The reply has `truncated` when a cap cut it short. State is a status row's state, or one of two display labels that are never on the wire: `queued` for a task in its queue with no usable row, `lost` as in 3.3 |
+| `get_result` | `task_id` | Full trusted result, or the current state if unfinished. No record is `isError` unknown `task_id` |
 
 Rejected: a generic `publish` tool (turns the channel into an injection amplifier); `reply` in chat style (structured results are the goal); `accept_task` as a separate tool (`update_task` already does it); `cancel_task` (needs a second control path; `timeout_s` bounds runaways, and it can come later); `get_task` for workers (compaction recovery is rare and the run timeout bounds it).
 
@@ -268,10 +274,10 @@ Each worker core-publishes `natter.presence.<name>` every 15s and on every state
 
 Heartbeats prove the server process lives, not that Claude is responsive. `update_task`, accept release and the run timeout cover that gap.
 
-**Attention sweep.** Every 30s the orchestrator reads open tasks from `NATTER_STATE`, drops any with a stored result (3.3), and pushes one `kind="attention"` per task and condition:
+**Attention sweep.** Every 30s the orchestrator reads open tasks from `NATTER_SENT` as `list_tasks` does, drops any with a trusted result (3.6), and pushes one `kind="attention"` per task and condition:
 
-- status `delivered` or `accepted`, and the worker's presence is stale;
-- status `released`;
+- status `delivered` or `accepted` at `natter.status.<to>.<id>`, and the worker's presence is stale;
+- status `released` at that subject;
 - open past `created_at + queue_ttl_s + accept_timeout_s + timeout_s + 300`.
 
 This covers a worker machine that dies for good, the one case no worker timer can report. It writes no results: Claude decides what to do. The one-per-condition memory is per process, so a restart may repeat a push.
@@ -290,17 +296,31 @@ Rejected:
 
 | Identity | Publish | Subscribe |
 | --- | --- | --- |
-| orchestrator | `natter.task.*`, `natter.status.*.*`, JS API for its durable, publish and direct get on the three streams | `_INBOX.orchestrator.>` |
+| orchestrator | `natter.task.*`, `natter.sent.*`, JS API for its durable, `$JS.API.STREAM.INFO.NATTER_SENT`, `$JS.API.STREAM.MSG.GET.NATTER_TASKS` (the stream allows no direct get), direct get on `NATTER_RESULTS`, `NATTER_STATE` and `NATTER_SENT` | `_INBOX.orchestrator.>` |
 | worker `<n>` | `natter.presence.<n>`, `natter.status.<n>.*`, `natter.result.<n>.*`, `$JS.API.INFO`, `$JS.API.STREAM.INFO.NATTER_TASKS`, `$JS.API.CONSUMER.INFO.NATTER_TASKS.task-<n>`, `$JS.API.CONSUMER.CREATE.NATTER_TASKS.task-<n>.natter.task.<n>`, `$JS.API.CONSUMER.MSG.NEXT.NATTER_TASKS.task-<n>`, `$JS.API.DIRECT.GET.NATTER_RESULTS.natter.result.<n>.>`, `$JS.API.DIRECT.GET.NATTER_STATE.natter.status.<n>.>`, `$JS.ACK.NATTER_TASKS.task-<n>.>` | `_INBOX.<n>.>` |
 | admin (bootstrap only) | `$JS.API.STREAM.>` for `NATTER_*` | `_INBOX.admin.>` |
 | dashboard (optional) | none | `natter.>` |
 
 Each connection sets `inboxPrefix: '_INBOX.<name>'` so one worker cannot sniff another's pull deliveries.
 
+**The trust rule.** ACLs bind a subject to a credential, but a worker may write any `task_id` under its own name, so nothing a worker can write proves a task was sent to it. A `queued` status could not: a worker can write one under its own name, and `delivered` overwrites it. So publish on `natter.sent.>` is granted to the orchestrator only, and workers are denied it. Workers are also denied direct get on `NATTER_SENT`, which keeps the record of other workers' tasks out of reach. Only the orchestrator's record counts:
+
+1. The record is stored with a PubAck before the task is published. If it fails, the task is not published.
+2. A result on `natter.result.<w>.<id>` is trusted only if the record exists, its `to` is `w`, and the result's stream timestamp is not older than the record's.
+3. Readers fetch the record first, then the exact subject `natter.result.<to>.<id>`, never a wildcard. Rows are read only at `natter.status.<to>.<id>`, and only for state, note and attempt. Everything else comes from the record, so no worker-written field can move, hide or rename a task.
+4. Only a trusted result closes a task. A `finished` row alone never does.
+5. `list_tasks` orders by stream sequence and stops at the `last_seq` it read at the start, so a tight-loop writer cannot extend the read and a back-dated `created_at` cannot displace a task.
+
+Task ids are not secret. They are random so they cannot be guessed ahead of a send, but they travel in clear subjects and through the worker that holds the task. The control is that a worker cannot write the record, and a pre-squatted result fails the timestamp check. `NATTER_SENT` is what makes old results checkable, so it outlives `NATTER_RESULTS` and must never be dropped: every result still in the durable would be terminated as having no record. Stream timestamps come from the one broker's wall clock, so a backward step between record and result would mark an honest result untrusted; the tools then add `note: 'result older than its record'`, so it does not read as a silent `lost`.
+
+**The ACL covers subjects, not headers.** A worker can put any `Nats-Msg-Id` on a publish it is allowed to make, and dedupe spans the stream. So no stream a worker can write may depend on `Nats-Msg-Id`: results carry none, and first-result-wins rests on `lastSubjectSequence: 0` and the per-subject limit. Tasks and records keep theirs, because only the orchestrator publishes on those streams.
+
+**Open for S9.** Per-worker storage limits, because one worker can nearly fill `NATTER_RESULTS` in 1.4s, and because evicting an honest `delivered` row weakens `max_attempts`.
+
 **Transport policy.** A URL with a non-loopback host must use `tls://` and must have a seed. Otherwise the server refuses to connect, and tools report why. Loopback may run unauthenticated for development. Accepted alternative: run over a WireGuard or Tailscale mesh, still with nkeys, using `tls://` unless the operator sets `NATTER_ALLOW_PLAINTEXT=1`.
 
 **Prompt-injection stance.**
-- Inbound gating: drop any envelope that fails validation or whose token disagrees with the subject. Tasks are accepted only from the `natter.task.<me>` subject, which only the orchestrator credential can publish.
+- Inbound gating: drop any envelope that fails validation or whose token disagrees with the subject, and any result the trust rule refuses. Tasks are accepted only from the `natter.task.<me>` subject, which only the orchestrator credential can publish.
 - `meta` holds only validated tokens: `kind`, `task_id`, `from`, `worker`, `attempt`, `timeout_s`, `outcome`, `reason`, `data_bytes`. Free text only ever appears in `content`. No `meta` key names a path, so no message can direct Claude to read a file through metadata. Same reasoning as the fakechat and telegram comments.
 - The plugin strips C0 controls except `\n` and `\t`, and ESC sequences, from `content`. It does not add its own tag escaping, because Claude Code 2.1.318 does that; README records the tested version.
 - Tasks are peer requests, never user consent. Results are data. Both `instructions` say so.
@@ -399,7 +419,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `src/bootstrap.ts`, `mise.toml` (`bootstrap` task), `test/bootstrap.test.ts`.
 - Depends on: S2.
-- Acceptance: creates the three streams; second run changes nothing; a drifted stream is updated; per-subject cap, `Nats-Msg-Id` dedupe, oversize rejection and first-result-wins hold on the real streams. This is the first exercise of the JetStream client in the repo.
+- Acceptance: creates the four streams; second run changes nothing and never drops `NATTER_SENT`; a drifted stream is updated; per-subject cap, `Nats-Msg-Id` dedupe, oversize rejection and first-result-wins hold on the real streams. This is the first exercise of the JetStream client in the repo.
 - Cheapest check: `bun test test/bootstrap.test.ts`.
 - Worker: infra.
 
@@ -424,7 +444,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `src/orchestrator.ts`, `src/instructions.ts`, `src/server.ts`, `test/orchestrator.test.ts`, `test/e2e.test.ts`.
 - Depends on: S2, S3. S4 for the end-to-end test.
-- Acceptance: a task the broker deleted at `max_age` shows as lost in `list_tasks` and `get_result`; `send_task` publishes the `queued` status before the task and never rewrites it, because a `queued` status means attempt 1 to a worker; a retried publish does not duplicate; full queue returns `isError`; a result is pushed once with summary and `data_bytes`, `get_result` returns `data` and `artifacts`; a result stored while the orchestrator is down is pushed on the next start; `list_tasks` shows open and finished tasks after a restart, and a task with a stored result as finished whatever its status row says; a result failing validation is dropped and logged; two real server processes, one per role, complete a task end to end.
+- Acceptance: a task the broker deleted at `max_age` shows as lost in `list_tasks` and `get_result`; `send_task` stores the record before the task, writes no status, and publishes no task if the record fails; a retried publish does not duplicate; full queue returns `isError`; a result is pushed once with summary and `data_bytes`, `get_result` returns `data` and `artifacts`; a result stored while the orchestrator is down is pushed on the next start; `list_tasks` shows open and finished tasks after a restart, and a task with a trusted result as finished whatever its status row says; a result failing validation is dropped and logged; two real server processes, one per role, complete a task end to end. Forgery: a second worker's row and result under the same id reach no push, `list_tasks` or `get_result`, and the real result still lands; a result pre-squatted before the record is rejected; a result for an id nobody sent is terminated with no push and stays stored; a `finished` row with no result stays open; a task stays visible when its row is evicted or its row carries a back-dated `created_at`; `list_tasks` returns in bounded time under a tight-loop writer; a missing `NATTER_SENT` leaves results unacked, `send_task` returns the bootstrap hint, and both recover after bootstrap.
 - Cheapest check: `bun test test/orchestrator.test.ts test/e2e.test.ts`.
 - Worker: design judgment.
 
@@ -432,7 +452,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `src/presence.ts`, `src/worker.ts`, `src/orchestrator.ts`, `test/presence.test.ts`.
 - Depends on: S5, S6.
-- Acceptance: `list_workers` shows a live worker; killed worker becomes `stale`; clean exit shows `offline`; an accept release shows `stalled` until a late tool call clears the latch; busy worker shows `task_id`; `send_task` to a never-seen name returns `isError`, to an offline but known worker succeeds and reports the state; stale worker with an open task produces one `attention` push; `released` and overdue each produce one push; a task with a stored result produces none, whatever its status row says.
+- Acceptance: `list_workers` shows a live worker; killed worker becomes `stale`; clean exit shows `offline`; an accept release shows `stalled` until a late tool call clears the latch; busy worker shows `task_id`; `send_task` to a never-seen name returns `isError`, to an offline but known worker succeeds and reports the state; stale worker with an open task produces one `attention` push; `released` and overdue each produce one push; a task with a trusted result produces none, whatever its status row says.
 - Cheapest check: `bun test test/presence.test.ts`.
 - Worker: design judgment.
 
@@ -448,7 +468,8 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `deploy/nats-server.example.conf`, `src/connection.ts`, `test/auth.test.ts`, `test/support/nats.ts` (nkey and TLS fixtures).
 - Depends on: S4, S6, S7.
-- Acceptance against the shipped template: a full task round trip works with nkeys and per-user inbox prefixes; worker cannot publish `natter.task.*`, cannot publish another worker's result, status or presence, cannot create or read another worker's consumer, cannot read `NATTER_RESULTS` for another worker; a forged envelope naming another worker is dropped; TLS with a CA file connects and an untrusted CA fails; seed with loose mode logs a warning; `<creds_dir>` traversal through a crafted name is impossible.
+- Open item from 3.6: per-worker storage limits.
+- Acceptance against the shipped template: a full task round trip works with nkeys and per-user inbox prefixes; worker cannot publish `natter.task.*`, cannot publish another worker's result, status or presence, cannot create or read another worker's consumer, cannot read `NATTER_RESULTS` for another worker, cannot publish `natter.sent.*`, cannot direct-get from `NATTER_SENT`; a forged envelope naming another worker is dropped; TLS with a CA file connects and an untrusted CA fails; seed with loose mode logs a warning; `<creds_dir>` traversal through a crafted name is impossible.
 - Cheapest check: `bun test test/auth.test.ts`.
 - Worker: infra.
 
@@ -456,7 +477,7 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 - Files: `README.md`, `src/instructions.ts`, `.claude-plugin/plugin.json` (version), `mise.toml` if needed.
 - Depends on: all.
-- Acceptance: README covers bootstrap's 1.5 GiB JetStream storage need, launch commands, `.claude/natter.json`, allow rules with exact tool names, orchestrator lockdown, bootstrap, auth setup, research-preview limits and tested Claude Code version; smoke checklist run once on two sessions, ideally across two machines over `tls://`; a planted result telling the orchestrator to change settings is not obeyed.
+- Acceptance: README covers bootstrap's 1.75 GiB JetStream storage need, launch commands, `.claude/natter.json`, allow rules with exact tool names, orchestrator lockdown, bootstrap, auth setup, research-preview limits and tested Claude Code version; smoke checklist run once on two sessions, ideally across two machines over `tls://`; a planted result telling the orchestrator to change settings is not obeyed.
 - Cheapest check: run the checklist; `mise run check`.
 - Worker: docs.
 
@@ -481,14 +502,14 @@ Order: S1, S2, then S3, S4, S5; S6 can run in parallel with S4 once S3 lands; th
 | Handler registration delay at startup | 5s covers it | S4 live check | Lost push: move to a longer grace |
 | `channels[].userConfig` prompts for dev-loaded plugins | Yes, or env works | S1 live check | No prompt: document env-only setup |
 | JetStream reconnect over long outages (hours, laptop sleep) | Consume loop plus outer restart recovers | Manual suspend during S10 | Stuck consumer: rebuild the consumer on reconnect |
-| `multi_last` with 200+ subjects | Batch limit behaves | S6 test with 250 statuses | Page through by subject filter |
+| `multi_last` with 200+ subjects | Resolved in S6: it answers 413 above 1024 results whatever `batch` says | S6 tests at 250 and 1100 records | `list_tasks` walks `NATTER_SENT` in windows, and `multi_last` is used only for at most 200 exact subjects |
 | Claude Code escaping stays in place | Holds across versions | README records tested version | If removed, add plugin-side neutralization |
 | A second orchestrator session on the same account | Shares the durable and splits pushes; no data loss | Reasoning; `list_tasks` still works | If this matters, add an orchestrator token in `v: 2` |
 
 ## 8. Risks and rollback
 
 - Channels are a research preview. Keep the contract in `src/server.ts` and `src/instructions.ts` so a change touches one place.
-- Stream config is the only durable contract. `bootstrap.ts` is idempotent, and drift is updated. Rollback is deleting `NATTER_*` streams, which only loses queued work; no repo data lives there.
+- Stream config is the only durable contract. `bootstrap.ts` is idempotent, and drift is updated. Rollback is deleting all the `NATTER_*` streams together, which only loses queued work; no repo data lives there. Never delete `NATTER_SENT` alone: every result still in the durable would be terminated.
 - Each slice is one or more commits on a feature branch. Reverting S7 to S9 leaves a working development setup on loopback.
 - The unattended case is weak by nature: a permission prompt stalls a worker until `timeout_s`. Pre-approved rules are the user's responsibility; README states this clearly.
 

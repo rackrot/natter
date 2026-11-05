@@ -4,6 +4,8 @@ import {
   type Envelope,
   encodeEnvelope,
   type FailureReason,
+  mintTaskId,
+  NUID_PATTERN,
   type ParsedMessage,
   type Presence,
   parseMessage,
@@ -11,8 +13,10 @@ import {
   presenceSubject,
   type Result,
   resultSubject,
+  type Sent,
   type Status,
   sanitizeContent,
+  sentSubject,
   statusSubject,
   type Task,
   taskSubject,
@@ -73,6 +77,19 @@ const status: Status = {
   timeout_s: 60,
   queue_ttl_s: 60,
 }
+const sent: Sent = {
+  v: 1,
+  type: 'sent',
+  task_id: ID,
+  to: 'w1',
+  title: 'title',
+  created_at: NOW,
+  root_task_id: ID2,
+  parent_task_id: ID2,
+  depth: 1,
+  timeout_s: 60,
+  queue_ttl_s: 60,
+}
 const presence: Presence = {
   v: 1,
   type: 'presence',
@@ -90,6 +107,8 @@ const subjectFor = (e: Envelope) => {
   switch (e.type) {
     case 'task':
       return taskSubject(e.to)
+    case 'sent':
+      return sentSubject(e.task_id)
     case 'result':
       return resultSubject(e.worker, e.task_id)
     case 'status':
@@ -104,6 +123,18 @@ const failure = (m: ParsedMessage) => {
 }
 const reasonOf = (subject: string, data: Uint8Array): FailureReason =>
   failure(parseMessage(subject, data)).reason
+
+describe('task ids', () => {
+  test('have the form of a nuid and do not count up', () => {
+    const ids = Array.from({ length: 2000 }, mintTaskId)
+    for (const id of ids) expect(id).toMatch(NUID_PATTERN)
+    expect(new Set(ids).size).toBe(ids.length)
+    // Consecutive nuids share their first twelve characters.
+    expect(new Set(ids.map((id) => id.slice(0, 12))).size).toBe(ids.length)
+    // The whole alphabet is in use, so no position is narrowed.
+    expect(new Set(ids.map((id) => id[0])).size).toBe(62)
+  })
+})
 
 describe('subjects', () => {
   test.each(['', 'A', 'a.b', 'a*', 'a>', '-a', 'a b', 'a'.repeat(65), 'a\n'])(
@@ -121,6 +152,7 @@ describe('subjects', () => {
     (bad) => {
       expect(() => resultSubject('w1', bad)).toThrow()
       expect(() => statusSubject('w1', bad)).toThrow()
+      expect(() => sentSubject(bad)).toThrow()
     },
   )
 
@@ -134,6 +166,7 @@ describe('subjects', () => {
       worker: 'w1',
       taskId: ID,
     })
+    expect(parseSubject(sentSubject(ID))).toEqual({ kind: 'sent', taskId: ID })
   })
 
   test.each([
@@ -146,13 +179,18 @@ describe('subjects', () => {
     'natter.task.W1',
     'natter.task.>',
     `natter.result.*.${ID}`,
+    'natter.sent',
+    'natter.sent.w1',
+    'natter.sent.*',
+    `natter.sent.${ID}.extra`,
+    `natter.sent.w1.${ID}`,
   ])('parseSubject rejects %p', (s) => {
     expect(parseSubject(s)).toBeUndefined()
   })
 })
 
 describe('envelopes', () => {
-  test.each([task, result, status, presence])(
+  test.each([task, sent, result, status, presence])(
     'round-trips $type',
     (envelope) => {
       const encoded = encodeEnvelope(envelope)
@@ -346,6 +384,8 @@ describe('versioning', () => {
 describe('subject binding', () => {
   test('task `to` must equal the subject worker', () => {
     expect(reasonOf(taskSubject('w2'), enc(task))).toBe('subject_mismatch')
+    expect(reasonOf(sentSubject(ID2), enc(sent))).toBe('subject_mismatch')
+    expect(reasonOf(sentSubject(ID), enc(result))).toBe('invalid')
   })
 
   test.each([
@@ -558,18 +598,23 @@ describe('field validation', () => {
     expect(ok({ ...result, reason: 'other' })).toBe(false)
   })
 
-  test.each([
-    'queued',
-    'delivered',
-    'accepted',
-    'stalled',
-    'released',
-    'finished',
-  ])('status state %s', (state) => {
-    expect(ok({ ...status, state })).toBe(true)
+  test.each(['delivered', 'accepted', 'stalled', 'released', 'finished'])(
+    'status state %s',
+    (state) => {
+      expect(ok({ ...status, state })).toBe(true)
+    },
+  )
+  test('a record has the limits of the task it stands for', () => {
+    expect(ok({ ...sent, title: 'x'.repeat(121) })).toBe(false)
+    expect(ok({ ...sent, timeout_s: 86401 })).toBe(false)
+    expect(ok({ ...sent, depth: -1 })).toBe(false)
+    expect(ok({ ...sent, parent_task_id: 'nope' })).toBe(false)
+    const { parent_task_id, ...root } = sent
+    expect(ok(root)).toBe(true)
   })
   test('status and presence states are closed sets', () => {
     expect(ok({ ...status, state: 'done' })).toBe(false)
+    expect(ok({ ...status, state: 'queued' })).toBe(false)
     expect(ok({ ...presence, state: 'finished' })).toBe(false)
   })
 

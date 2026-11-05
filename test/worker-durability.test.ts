@@ -262,7 +262,6 @@ const recordResult = async (worker: string, task_id: string) => {
   })
   if (!encoded.ok) throw new Error(encoded.issues.join('; '))
   await jetstream(nc).publish(resultSubject(worker, task_id), encoded.bytes, {
-    msgID: task_id,
     expect: { lastSubjectSequence: 0 },
   })
 }

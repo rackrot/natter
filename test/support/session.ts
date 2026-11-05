@@ -31,6 +31,17 @@ export interface Session {
   close(): Promise<void>
 }
 
+export interface ToolReply {
+  isError?: boolean
+  content: { type: string; text: string }[]
+}
+
+export const callTool = async (
+  s: Pick<Session, 'client'>,
+  name: string,
+  args: Record<string, unknown> = {},
+) => (await s.client.callTool({ name, arguments: args })) as ToolReply
+
 /**
  * Spawns `bun src/server.ts` and completes the MCP handshake. The server
  * gets exactly `env` plus a PATH, so ambient NATTER_* or CLAUDE_* variables
