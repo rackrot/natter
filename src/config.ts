@@ -216,6 +216,14 @@ export function resolveLimits(env: Env) {
   }
 }
 
+/** The command that opens a URL. Tests point `NATTER_TEST_OPENER` at a stub. */
+export function resolveOpener(env: Env, platform = process.platform): string {
+  return (
+    get(env, 'NATTER_TEST_OPENER') ??
+    (platform === 'darwin' ? 'open' : 'xdg-open')
+  )
+}
+
 export type Transport =
   | { refused: string }
   | {

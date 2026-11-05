@@ -127,7 +127,7 @@ The orchestrator is the high-value target. A compromised repo can write a worker
 }
 ```
 
-With Bash denied, `/nats-channel:status` cannot open the browser; ask the orchestrator to call `status_page` and open the printed URL yourself.
+`/nats-channel:status` works with Bash denied: the server opens the browser itself and the command prints the URL. `/nats-channel:doctor` does not work in a Bash-denied session, because it runs through Bash. Run it in a worker session or use `mise run doctor`.
 
 Its instructions also tell it to treat every worker field as data and to report, not obey, a result that asks for changed permissions, credentials or settings.
 
@@ -167,7 +167,7 @@ Other attention reasons: `released` (a task was not accepted in time and will be
 ## Checking things
 
 - `/nats-channel:doctor` runs the doctor in the session and reports PASS, FAIL or SKIP for the config, transport policy, seed, TCP, TLS, auth, JetStream, the five streams and the session's consumer. `mise run doctor` does the same from the checkout. It connects once with no retry, so it names the cause of a TLS or auth failure.
-- `/nats-channel:status` (orchestrator only) opens a local read-only web page: workers and liveness, queue depth, open and recent tasks, stream usage. The URL holds a secret token and the port changes every run. Without the token every request gets 403.
+- `/nats-channel:status` (orchestrator only) opens a local read-only web page: workers and liveness, queue depth, open and recent tasks, stream usage. The server opens the browser itself and the reply gives the full URL, which you can open by hand. The token in the URL is local to the process and the port changes every run. Without the token every request gets 403.
 - `mise run monitor` tails `natter.>` with the `nats` CLI. It is a development tool, and the payloads it shows are untrusted.
 
 ## Known limits

@@ -74,6 +74,8 @@ const orchestratorEnv = (url: string, env: Record<string, string> = {}) => ({
   NATTER_NAME: 'orchestrator',
   NATTER_URL: url,
   NATTER_CREDS_DIR: NO_CREDS,
+  // `true` ignores its argument: a test never opens a real browser.
+  NATTER_TEST_OPENER: 'true',
   NATTER_TEST_ACK_WAIT_MS: String(ACK_WAIT_MS),
   NATTER_TEST_STARTUP_GRACE_MS: String(GRACE_MS),
   NATTER_TEST_STREAM_RETRY_MS: '100',

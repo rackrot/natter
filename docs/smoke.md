@@ -53,7 +53,7 @@ JSON
 cksum ~/natter-smoke/orch/.claude/settings.json
 ```
 
-Note the checksum. The orchestrator denies Bash, so the status page step later opens the URL by hand.
+Note the checksum.
 
 Terminal B:
 
@@ -71,9 +71,9 @@ Accept the development channel warning in both. Pass: each session starts withou
 
 ## 3. Doctor
 
-In B and in C, run `/nats-channel:doctor`.
+In C, run `/nats-channel:doctor`. B denies Bash and the doctor runs through Bash, so it does not work in B.
 
-Pass: every line is PASS and no line is FAIL. In C the consumer line is PASS or says the session creates it on first connect.
+Pass: every line is PASS and no line is FAIL. The consumer line is PASS or says the session creates it on first connect.
 
 ## 4. Task round trip
 
@@ -103,7 +103,7 @@ Optional: send the same task again and deny the prompt. The task stays `waiting_
 
 ## 6. Status page
 
-In B run `/nats-channel:status`. Bash is denied there, so the open step fails. Ask B for the URL instead: `Call status_page and print the URL`. Open it in a browser.
+In B run `/nats-channel:status`. The server opens the browser itself, so this works with Bash denied. B prints the full URL, token included.
 
 Pass:
 - The Workers table lists `smoke-worker` with state `idle` or `busy`, `stale` false.
@@ -116,7 +116,7 @@ Pass:
 read -r url
 ```
 
-Paste the full URL, press Enter, then:
+Paste the full URL from B's reply, press Enter, then:
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' "${url%%\?*}"

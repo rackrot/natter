@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js'
 import {
@@ -25,6 +26,7 @@ import {
   type Env,
   OVERDUE_MARGIN_S,
   resolveLimits,
+  resolveOpener,
   resolveTimers,
 } from './config'
 import type { Connection } from './connection'
@@ -133,7 +135,7 @@ export const ORCHESTRATOR_TOOLS = [
   {
     name: 'status_page',
     description:
-      'The URL of a local web page that shows the workers, their queues, the tasks and stream usage. It is read-only. Open it in the browser for your user; the URL holds a secret, so do not share it.',
+      'Opens a local web page in the browser that shows the workers, their queues, the tasks and stream usage, and returns its URL. It is read-only. Give your user the complete URL unchanged, token included: it is local to this process and they may need to open it by hand. Call it yourself, not through a subagent.',
     inputSchema: z.toJSONSchema(z.object({})),
   },
   {
@@ -241,6 +243,30 @@ class TokenBucket {
       Math.ceil(((1 - this.tokens) * this.windowMs) / this.capacity),
     )
   }
+}
+
+// How long the tool waits to learn whether the opener failed. xdg-open can stay
+// alive while the browser starts, so silence past this counts as opened.
+const OPENER_WAIT_MS = 1000
+
+/** Runs the opener detached with its stdio ignored, so MCP stdout is untouched. */
+async function openInBrowser(command: string, url: string): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(true), OPENER_WAIT_MS)
+    const done = (opened: boolean) => {
+      clearTimeout(timer)
+      resolve(opened)
+    }
+    try {
+      // No shell: the URL is one argv element.
+      const child = spawn(command, [url], { detached: true, stdio: 'ignore' })
+      child.once('error', () => done(false))
+      child.once('exit', (code) => done(code === 0))
+      child.unref()
+    } catch {
+      done(false)
+    }
+  })
 }
 
 const reply = (value: unknown): ToolResult => ({
@@ -1090,13 +1116,18 @@ export function createOrchestrator({
         throw new McpError(ErrorCode.InvalidParams, `unknown tool: ${name}`)
       }
       if (name === 'status_page') {
-        return page
-          ? { content: [{ type: 'text', text: page.url }] }
-          : toolError(
-              pageFailure
-                ? `the status page failed to start: ${pageFailure}`
-                : 'the status page has not started yet',
-            )
+        if (!page) {
+          return toolError(
+            pageFailure
+              ? `the status page failed to start: ${pageFailure}`
+              : 'the status page has not started yet',
+          )
+        }
+        const opened = await openInBrowser(resolveOpener(env), page.url)
+        const note = opened
+          ? 'Opened in the browser.'
+          : 'The browser could not be opened; open the URL by hand.'
+        return { content: [{ type: 'text', text: `${note} ${page.url}` }] }
       }
       const { nc, unavailable } = connection
       if (!nc) {

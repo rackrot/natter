@@ -7,6 +7,7 @@ import {
   setDefaultTimeout,
   test,
 } from 'bun:test'
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -35,6 +36,19 @@ setDefaultTimeout(15_000)
 
 const NO_CREDS = join(tmpdir(), 'natter-no-creds')
 const HOME = join(tmpdir(), 'natter-status-page-home')
+// A stub opener for every session: a test never opens a real browser.
+const STUB_DIR = mkdtempSync(join(tmpdir(), 'natter-opener-'))
+const OPENED = join(STUB_DIR, 'opened')
+
+const stub = (name: string, body: string) => {
+  const path = join(STUB_DIR, name)
+  writeFileSync(path, `#!/bin/sh\n${body}\n`)
+  chmodSync(path, 0o755)
+  return path
+}
+const RECORDING = stub('record', `printf '%s' "$1" > '${OPENED}'`)
+const FAILING = stub('fail', 'exit 3')
+const SLOW = stub('slow', 'sleep 5')
 
 let nats: TestNats
 let down: TestNats
@@ -43,12 +57,13 @@ let js: JetStreamClient
 let jsm: JetStreamManager
 const sessions: Session[] = []
 
-const sessionEnv = (role: string, url = nats.url) => ({
+const sessionEnv = (role: string, url = nats.url, opener = RECORDING) => ({
   NATTER_ROLE: role,
   NATTER_NAME: role === 'worker' ? freshName() : 'orchestrator',
   NATTER_URL: url,
   NATTER_CREDS_DIR: NO_CREDS,
   HOME,
+  NATTER_TEST_OPENER: opener,
   NATTER_TEST_STARTUP_GRACE_MS: '20',
   NATTER_TEST_CONNECT_POLL_MS: '20',
   NATTER_TEST_HEARTBEAT_MS: '50',
@@ -57,8 +72,8 @@ const sessionEnv = (role: string, url = nats.url) => ({
 
 const freshName = () => `w-${crypto.randomUUID()}`
 
-const start = async (role: string, url = nats.url) => {
-  const s = await startSession(sessionEnv(role, url))
+const start = async (role: string, url = nats.url, opener = RECORDING) => {
+  const s = await startSession(sessionEnv(role, url, opener))
   sessions.push(s)
   return s
 }
@@ -66,7 +81,8 @@ const start = async (role: string, url = nats.url) => {
 const pageUrl = async (s: Session) => {
   const reply = await callTool(s, 'status_page')
   expect(reply.isError).toBeUndefined()
-  return new URL(reply.content[0]?.text ?? '')
+  // The reply is a note, a space, and the URL.
+  return new URL(reply.content[0]?.text.split(' ').pop() ?? '')
 }
 
 /** The page's JSON endpoint, with the token and Host of the real URL. */
@@ -215,6 +231,44 @@ test('the status_page tool is listed only for the orchestrator', async () => {
   const url = await pageUrl(orchestrator)
   expect(url.hostname).toBe('127.0.0.1')
   expect(url.searchParams.get('token')).toMatch(/\S{16,}/)
+})
+
+test('status_page hands the full URL, token included, to the opener', async () => {
+  const orchestrator = await start('orchestrator')
+  const url = await pageUrl(orchestrator)
+  expect(readFileSync(OPENED, 'utf8')).toBe(url.href)
+})
+
+test('a failing opener still returns the URL and not an error', async () => {
+  const orchestrator = await start('orchestrator', nats.url, FAILING)
+  const reply = await callTool(orchestrator, 'status_page')
+  expect(reply.isError).toBeUndefined()
+  const url = new URL(reply.content[0]?.text.split(' ').pop() ?? '')
+  expect(url.searchParams.get('token')).toMatch(/\S{16,}/)
+  expect(reply.content[0]?.text.endsWith(url.href)).toBe(true)
+  expect((await poll(url)).status).toBe(200)
+})
+
+test('a missing opener still returns the URL and not an error', async () => {
+  const orchestrator = await start(
+    'orchestrator',
+    nats.url,
+    join(STUB_DIR, 'absent'),
+  )
+  const reply = await callTool(orchestrator, 'status_page')
+  expect(reply.isError).toBeUndefined()
+  expect(new URL(reply.content[0]?.text.split(' ').pop() ?? '').search).toMatch(
+    /token=/,
+  )
+})
+
+test('an opener that keeps running does not hold the reply', async () => {
+  const orchestrator = await start('orchestrator', nats.url, SLOW)
+  const started = performance.now()
+  const reply = await callTool(orchestrator, 'status_page')
+  expect(performance.now() - started).toBeLessThan(3000)
+  expect(reply.isError).toBeUndefined()
+  expect(reply.content[0]?.text).toMatch(/token=/)
 })
 
 test('a request needs the token, the loopback Host, and GET', async () => {
