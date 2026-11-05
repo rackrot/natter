@@ -160,6 +160,8 @@ On the server, copy `deploy/nats-server.example.conf`, put that public key in `a
 
 When a worker stops at a permission prompt, a hook marks its task `waiting_permission`. The orchestrator then gets a `kind="attention"` push with `reason="waiting_permission"`, within the 30 second sweep. It cannot approve the prompt, so it tells you which worker needs you. The status returns to `accepted` after the next tool call that runs.
 
+When a worker's turn ends on an API error, such as a rate limit (a safeguard block is unconfirmed, see Known limits), a `StopFailure` hook marks its task `session_error` with the error type as the note, and the orchestrator gets a push with `reason="session_error"`. The worker needs you at its terminal. The error's details and the last message are not sent.
+
 `stale` means nothing has been heard from the worker for 45 seconds. Heartbeats come from the plugin's server process every 15 seconds, not from Claude. A busy or quiet Claude never goes stale; `stale` means the worker's server process stopped answering, for example the session ended or the machine is gone. It does not mean the worker is waiting on a command.
 
 Other attention reasons: `released` (a task was not accepted in time and will be redelivered) and `overdue` (open far past its timeouts).
@@ -176,6 +178,7 @@ Other attention reasons: `released` (a task was not accepted in time and will be
 - Tested with Claude Code 2.1.318. The plugin relies on Claude Code escaping channel content and does not add its own tag escaping.
 - `/nats-channel:doctor` does not see plugin settings. It runs in a shell and reads `NATTER_URL`, `NATTER_CREDS_DIR` and `NATTER_CA_FILE` only, so with non-default settings it checks the defaults unless you export those variables before starting Claude.
 - A deny at a permission prompt fires no hook, so the task stays `waiting_permission` until the worker's next `update_task` or `finish_task`.
+- The `session_error` alert does not stop the retries: it does not fail the task or change the accept timer, so a blocked prompt can be sent again, up to 3 attempts. Whether `StopFailure` fires on a safeguard block is not yet confirmed live.
 - The permission hooks need `CLAUDE_CODE_SESSION_ID` and `HOME`. Without them the alert is not raised.
 - No real two-machine TLS run has been done. The TLS path is tested against the shipped server template on one machine.
 - The status page has not been tried in a real browser.

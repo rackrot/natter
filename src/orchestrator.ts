@@ -90,6 +90,7 @@ const PUSH_LIMIT: Record<AttentionReason, number> = {
   released: 1,
   overdue: 1,
   waiting_permission: 1,
+  session_error: 1,
 }
 const NOT_FOUND = 404
 const NO_RESPONDERS = 503
@@ -917,7 +918,8 @@ export function createOrchestrator({
   const isHeld = (row: Status | undefined) =>
     row?.state === 'delivered' ||
     row?.state === 'accepted' ||
-    row?.state === 'waiting_permission'
+    row?.state === 'waiting_permission' ||
+    row?.state === 'session_error'
 
   /**
    * Plan 3.5. Starts from the records and reads only the subjects they name, so
@@ -960,16 +962,14 @@ export function createOrchestrator({
         }
         if (row?.state === 'released') reasons.push('released')
         // Alive and busy with this task: a release or a kill -9 leaves a row behind.
-        if (
-          row?.state === 'waiting_permission' &&
-          claimed &&
-          msg &&
-          !isStale(msg, timers.stale)
-        ) {
-          reasons.push('waiting_permission')
-        } else if (row?.state !== 'waiting_permission') {
-          // The prompt was answered, so the next one on this task alerts too.
-          delete raised.get(sent.task_id)?.pushes.waiting_permission
+        const alive = claimed && msg && !isStale(msg, timers.stale)
+        for (const reason of ['waiting_permission', 'session_error'] as const) {
+          if (row?.state === reason && alive) {
+            reasons.push(reason)
+          } else if (row?.state !== reason) {
+            // Answered or revived, so the next one on this task alerts too.
+            delete raised.get(sent.task_id)?.pushes[reason]
+          }
         }
         if (isOverdue(sent)) reasons.push('overdue')
         for (const reason of reasons) {

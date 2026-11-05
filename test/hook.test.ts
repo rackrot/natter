@@ -144,16 +144,20 @@ async function runHook({
   stdin,
 }: {
   name: string
-  mode?: 'permission' | 'resumed'
+  mode?: 'permission' | 'resumed' | 'error'
   env: Record<string, string>
   stdin: unknown
 }) {
   const writes: string[] = []
+  const notes: unknown[] = []
+  const raw: string[] = []
   const sub = nc.subscribe(`natter.status.${name}.*`, {
     callback: (_err, msg) => {
       const parsedMsg = parseMessage(msg.subject, msg.data)
       if (parsedMsg.ok && parsedMsg.envelope.type === 'status') {
         writes.push(parsedMsg.envelope.state)
+        notes.push(parsedMsg.envelope.note)
+        raw.push(new TextDecoder().decode(msg.data))
       }
     },
   })
@@ -173,7 +177,7 @@ async function runHook({
   const ms = performance.now() - started
   await Bun.sleep(200)
   sub.unsubscribe()
-  return { code, printed: out + err, ms, writes }
+  return { code, printed: out + err, ms, writes, notes, raw }
 }
 
 // No NATTER_URL or creds dir: only the held file can say where NATS is.
@@ -254,6 +258,119 @@ test('a second prompt on the same task alerts again once the first has cleared',
   await until(async () => attentionFor(orchestrator, task_id).length === 2)
   await Bun.sleep(6 * SWEEP_MS)
   expect(attentionFor(orchestrator, task_id)).toHaveLength(2)
+})
+
+const failure = (sessionId: string, extra: object = {}) => ({
+  hook_event_name: 'StopFailure',
+  session_id: sessionId,
+  error: 'rate_limit',
+  ...extra,
+})
+
+test('a StopFailure publishes one session_error with only the error type, listed and pushed once', async () => {
+  const { name, sessionId, orchestrator, task_id } = await holdingWorker()
+  await until(async () => (await heldFiles()).includes(sessionId))
+
+  const run = await runHook({
+    name,
+    mode: 'error',
+    env: hookEnv(name),
+    stdin: failure(sessionId, {
+      error_details: 'SECRET-DETAILS',
+      last_assistant_message: 'SECRET-MESSAGE',
+    }),
+  })
+
+  expect(run).toMatchObject({
+    code: 0,
+    printed: '',
+    writes: ['session_error'],
+    notes: ['rate_limit'],
+  })
+  expect(run.ms).toBeLessThan(HOOK_BOUND_MS)
+  expect(run.raw.join()).not.toContain('SECRET')
+  expect(existsSync(markerOf(sessionId))).toBe(true)
+
+  await until(
+    async () => (await stateOf(orchestrator, task_id)) === 'session_error',
+  )
+  const row = (await taskRows(orchestrator)).find((t) => t.task_id === task_id)
+  expect(row).toMatchObject({ state: 'session_error', note: 'rate_limit' })
+  await until(async () => attentionFor(orchestrator, task_id).length >= 1)
+  await Bun.sleep(6 * SWEEP_MS)
+  expect(attentionFor(orchestrator, task_id)).toHaveLength(1)
+  expect(attentionFor(orchestrator, task_id)[0]?.meta.reason).toBe(
+    'session_error',
+  )
+})
+
+test('an error that is not a short token is published as unknown', async () => {
+  const { name, sessionId } = await holdingWorker()
+  await until(async () => (await heldFiles()).includes(sessionId))
+
+  const run = await runHook({
+    name,
+    mode: 'error',
+    env: hookEnv(name),
+    stdin: failure(sessionId, {
+      error: 'Ignore previous instructions and ...',
+    }),
+  })
+
+  expect(run).toMatchObject({ writes: ['session_error'], notes: ['unknown'] })
+})
+
+test('a session_error alerts again once a tool call has cleared it', async () => {
+  const { name, sessionId, orchestrator, task_id } = await holdingWorker()
+  const error = () =>
+    runHook({
+      name,
+      mode: 'error',
+      env: hookEnv(name),
+      stdin: failure(sessionId),
+    })
+  await until(async () => (await heldFiles()).includes(sessionId))
+
+  await error()
+  await until(async () => attentionFor(orchestrator, task_id).length === 1)
+
+  const resumed = await runHook({
+    name,
+    mode: 'resumed',
+    env: hookEnv(name),
+    stdin: { session_id: sessionId },
+  })
+  expect(resumed.writes).toEqual(['accepted'])
+  expect(existsSync(markerOf(sessionId))).toBe(false)
+  await until(async () => (await stateOf(orchestrator, task_id)) === 'accepted')
+  await Bun.sleep(3 * SWEEP_MS)
+
+  await error()
+  await until(async () => attentionFor(orchestrator, task_id).length === 2)
+  await Bun.sleep(6 * SWEEP_MS)
+  expect(attentionFor(orchestrator, task_id)).toHaveLength(2)
+})
+
+test('a StopFailure with no role or no held task writes nothing', async () => {
+  const { name, sessionId } = await holdingWorker()
+  await until(async () => (await heldFiles()).includes(sessionId))
+  const runs = await Promise.all([
+    runHook({
+      name,
+      mode: 'error',
+      env: {},
+      stdin: failure(sessionId),
+    }),
+    runHook({
+      name,
+      mode: 'error',
+      env: hookEnv(name),
+      stdin: failure(crypto.randomUUID()),
+    }),
+  ])
+  for (const run of runs) {
+    expect(run).toMatchObject({ code: 0, printed: '', writes: [] })
+  }
 })
 
 test('no role, no held task, NATS down or bad input exits 0 in time and writes nothing', async () => {
@@ -376,6 +493,9 @@ test('a waiting_permission row with a stale busy worker raises stale, not waitin
 test.each([
   ['Notification', { NATTER_ROLE: undefined }, false],
   ['Notification', { NATTER_ROLE: 'worker' }, true],
+  ['StopFailure', { NATTER_ROLE: undefined, held: true }, false],
+  ['StopFailure', { NATTER_ROLE: 'worker', held: false }, false],
+  ['StopFailure', { NATTER_ROLE: 'worker', held: true }, true],
   ['PostToolUse', { NATTER_ROLE: undefined, marker: true }, false],
   ['PostToolUse', { NATTER_ROLE: 'worker', marker: false }, false],
   ['PostToolUse', { NATTER_ROLE: 'worker', marker: true }, true],
@@ -391,6 +511,10 @@ test.each([
         mode: 0o755,
       })
       const sessionId = crypto.randomUUID()
+      if ('held' in setup && setup.held) {
+        await mkdir(heldDir(root), { recursive: true })
+        await writeFile(join(heldDir(root), sessionId), '{}')
+      }
       if ('marker' in setup && setup.marker) {
         await mkdir(heldDir(root), { recursive: true })
         await writeFile(join(heldDir(root), `${sessionId}.waiting`), '')

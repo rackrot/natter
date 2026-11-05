@@ -12,6 +12,17 @@
         ]
       }
     ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$NATTER_ROLE\" ] && [ -f \"$HOME/.local/state/natter/held/$CLAUDE_CODE_SESSION_ID\" ] || exit 0; bun \"${CLAUDE_PLUGIN_ROOT}/src/hook.ts\" error >/dev/null 2>&1; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [

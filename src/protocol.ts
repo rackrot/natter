@@ -136,6 +136,7 @@ export const ATTENTION_REASONS = [
   'released',
   'overdue',
   'waiting_permission',
+  'session_error',
 ] as const
 export type AttentionReason = (typeof ATTENTION_REASONS)[number]
 
@@ -288,6 +289,7 @@ export const StatusSchema = z.object({
     'delivered',
     'accepted',
     'waiting_permission',
+    'session_error',
     'stalled',
     'released',
     'finished',
