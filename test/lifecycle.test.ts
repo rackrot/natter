@@ -75,7 +75,7 @@ test('closing stdin exits the process within 3s while NATS is connected', async 
 
 test('an unreadable seed keeps the session up with no broker client', async () => {
   const creds = join(scratch, 'creds')
-  await mkdir(join(creds, 'noread.nk'), { recursive: true })
+  await mkdir(join(creds, 'natter.nk'), { recursive: true })
   const before = await up.totalConnections()
 
   const s = await worker(up.url, 'noread', { NATTER_CREDS_DIR: creds })

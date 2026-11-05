@@ -51,6 +51,8 @@ export async function startNats(
     jetstream?: boolean
     autostart?: boolean
     tls?: { certFile: string; keyFile: string }
+    /** A nats-server config file; the flags below still set address, ports and store. */
+    configFile?: string
   } = {},
 ): Promise<TestNats> {
   const [port, monitorPort] = freePorts()
@@ -68,10 +70,11 @@ export async function startNats(
     String(port),
     '-m',
     String(monitorPort),
-    '-sd',
-    storeDir,
   ]
-  if (opts.jetstream) args.push('-js')
+  // A config file sets its own store and JetStream.
+  if (opts.configFile) args.push('-c', opts.configFile)
+  else args.push('-sd', storeDir)
+  if (opts.jetstream && !opts.configFile) args.push('-js')
   if (opts.tls) {
     args.push('--tls', '--tlscert', opts.tls.certFile)
     args.push('--tlskey', opts.tls.keyFile)

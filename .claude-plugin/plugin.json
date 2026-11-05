@@ -37,7 +37,7 @@
         "creds_dir": {
           "type": "directory",
           "title": "Credentials directory",
-          "description": "Directory holding <name>.nk seed files.",
+          "description": "Directory holding natter.nk, the shared seed.",
           "default": "~/.config/natter"
         },
         "ca_file": {

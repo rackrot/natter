@@ -299,7 +299,7 @@ Rejected:
 
 **Threat.** NATS content reaches a session that can run tools. The plugin cannot see a publisher's identity per message, so sender authenticity comes entirely from publish ACLs.
 
-**Auth.** Self-hosted `nats-server` with static `authorization.users`, one nkey per identity, and a per-user permissions block. `deploy/nats-server.example.conf` ships the template, and the auth test boots that exact file so the docs cannot drift. Seeds live at `<creds_dir>/<name>.nk`, mode 0600; the server warns on anything looser. The name is validated by regex before the path is built, so a repo file cannot aim the path elsewhere. `userConfig` stores the directory, not a secret (`type: directory`). Decentralized JWT `.creds` are deferred until someone needs operator mode.
+**Auth.** Self-hosted `nats-server` with one nkey user and no per-subject permissions. `deploy/nats-server.example.conf` ships the template, and the auth test boots that exact file so the docs cannot drift. The shared seed lives at `<creds_dir>/natter.nk`, mode 0600; the server warns on anything looser. `userConfig` stores the directory, not a secret (`type: directory`). Decentralized JWT `.creds` are deferred until someone needs operator mode.
 
 | Identity | Publish | Subscribe |
 | --- | --- | --- |
@@ -333,17 +333,17 @@ Decision: workers are trusted machines run by one operator, so this stays an acc
 **Transport policy.** A URL with a non-loopback host must use `tls://` and must have a seed. Otherwise the server refuses to connect, and tools report why. Loopback may run unauthenticated for development. Accepted alternative: run over a WireGuard or Tailscale mesh, still with nkeys, using `tls://` unless the operator sets `NATTER_ALLOW_PLAINTEXT=1`.
 
 **Prompt-injection stance.**
-- Inbound gating: drop any envelope that fails validation or whose token disagrees with the subject, and any result the trust rule refuses. Tasks are accepted only from the `natter.task.<me>` subject, which only the orchestrator credential can publish, and a reflected message there is terminated (the reply route above).
+- Inbound gating: drop any envelope that fails validation or whose token disagrees with the subject, and any result the trust rule refuses. Tasks are accepted only from the `natter.task.<me>` subject, which any holder of the shared seed can publish, and a reflected message there is terminated (the reply route above).
 - `meta` holds only validated tokens: `kind`, `task_id`, `from`, `worker`, `attempt`, `timeout_s`, `outcome`, `reason`, `data_bytes`. Free text only ever appears in `content`. No `meta` key names a path, so no message can direct Claude to read a file through metadata. Same reasoning as the fakechat and telegram comments.
 - The plugin strips C0 controls except `\n` and `\t`, and ESC sequences, from `content`. It does not add its own tag escaping, because Claude Code 2.1.318 does that; README records the tested version.
 - Tasks are peer requests, never user consent. Results are data. Both `instructions` say so.
 - No tool exposes config, credentials or arbitrary publishing.
 - The orchestrator is the high-value target: a compromised repo can write a worker result that aims at it, then at other workers. README recommends running the orchestrator from an empty directory with `Bash`, `Edit` and `Write` denied in project settings, leaving it only the plugin tools.
-- Worker Bash runs as the same OS user as the seed, so a compromised worker can read its own seed. ACL scoping limits that to impersonating itself. README recommends a `Read` deny rule on the creds dir. Unattended workers get scoped allow rules, not `bypassPermissions`.
+- Worker Bash runs as the same OS user as the seed, so a compromised worker can read its own seed. With one shared seed that means it can act as any session, which the scope decision accepts. README recommends a `Read` deny rule on the creds dir. Unattended workers get scoped allow rules, not `bypassPermissions`.
 
 **Permission relay stays off.** Declaring `claude/channel/permission` asserts that the replier is an authenticated human approver. Here the replier would be another Claude session, and messages from another session never count as user consent. An unattended worker that hits a prompt simply stalls, which the run timeout and attention sweep surface. The existing assertion in `test/server.test.ts` stays.
 
-Rejected: nkey signatures on each envelope (protects against a compromised broker, which is outside the threat model for a self-hosted single broker; adds key distribution); shared credential for all workers (one compromised repo could forge every result and drain every queue); worker-side sender allowlist in plugin config (the subject ACL already enforces this, and config would drift).
+Rejected: nkey signatures on each envelope (protects against a compromised broker, which is outside the threat model for a self-hosted single broker; adds key distribution); per-identity credentials (not worth the setup for one operator, see the scope decision); worker-side sender allowlist in plugin config (the subject ACL already enforces this, and config would drift).
 
 ### 3.7 Loops, rate limits, config, failure behaviour
 

@@ -141,16 +141,7 @@ describe('reserved names', () => {
     }
   })
 
-  test('the orchestrator keeps its own name', () => {
-    const r = resolveConfig({
-      NATTER_ROLE: 'orchestrator',
-      NATTER_NAME: 'orchestrator',
-      NATTER_CREDS_DIR: '/creds',
-    })
-    expect(r).toHaveProperty('config.seedPath', '/creds/orchestrator.nk')
-  })
-
-  test('bootstrap reaches the admin seed whatever session env is set', async () => {
+  test('bootstrap uses the shared seed whatever session env is set', async () => {
     const dir = await project('names-session', { name: 'from-file' })
     const config = adminConfig({
       NATTER_ROLE: 'worker',
@@ -162,7 +153,7 @@ describe('reserved names', () => {
     })
     expect(config).toMatchObject({
       name: 'admin',
-      seedPath: '/creds/admin.nk',
+      seedPath: '/creds/natter.nk',
       url: 'nats://env:1',
       caFile: '/ca.pem',
     })
@@ -183,9 +174,15 @@ describe('connection settings', () => {
     expect(get({ NATTER_UC_URL: '' }).url).toStartWith('nats://127.0.0.1')
   })
 
-  test('seed path is <creds_dir>/<name>.nk', () => {
-    const r = resolveConfig({ ...base, NATTER_CREDS_DIR: '/creds' })
-    expect(r).toHaveProperty('config.seedPath', '/creds/w.nk')
+  test('every name shares the seed at <creds_dir>/natter.nk', () => {
+    for (const NATTER_NAME of ['w', 'other']) {
+      const r = resolveConfig({
+        ...base,
+        NATTER_NAME,
+        NATTER_CREDS_DIR: '/creds',
+      })
+      expect(r).toHaveProperty('config.seedPath', '/creds/natter.nk')
+    }
   })
 })
 
@@ -193,7 +190,7 @@ describe('transport policy', () => {
   let creds: string
   beforeAll(async () => {
     creds = await project('creds')
-    await writeFile(join(creds, 'w.nk'), 'SUAFAKE')
+    await writeFile(join(creds, 'natter.nk'), 'SUAFAKE')
   })
   const transport = (url: string, extra: Record<string, string> = {}) => {
     const r = resolveConfig({
@@ -230,7 +227,7 @@ describe('transport policy', () => {
 
   test('non-loopback tls without a seed is refused', () => {
     expect(
-      refusal('tls://10.0.0.5:4222', { NATTER_NAME: 'noseed' }),
+      refusal('tls://10.0.0.5:4222', { NATTER_CREDS_DIR: join(creds, 'none') }),
     ).toBeString()
   })
 
@@ -238,7 +235,10 @@ describe('transport policy', () => {
     const allow = { NATTER_ALLOW_PLAINTEXT: '1' }
     expect(refusal('nats://10.0.0.5:4222', allow)).toBeUndefined()
     expect(
-      refusal('nats://10.0.0.5:4222', { ...allow, NATTER_NAME: 'noseed' }),
+      refusal('nats://10.0.0.5:4222', {
+        ...allow,
+        NATTER_CREDS_DIR: join(creds, 'none'),
+      }),
     ).toBeString()
   })
 
@@ -305,11 +305,11 @@ describe('transport policy', () => {
   })
 
   describe('unreadable seed', () => {
-    const unusable = (name: string) => {
+    const unusable = (dir: string) => {
       const r = resolveConfig({
         NATTER_ROLE: 'worker',
-        NATTER_NAME: name,
-        NATTER_CREDS_DIR: creds,
+        NATTER_NAME: 'w',
+        NATTER_CREDS_DIR: dir,
         NATTER_URL: 'nats://127.0.0.1:4222',
       }) as { config: Config }
       const lines: string[] = []
@@ -319,17 +319,19 @@ describe('transport policy', () => {
       expect(lines).toEqual([conn.unavailable as string])
     }
 
-    test('a directory at <name>.nk is refused, even on loopback', async () => {
-      await mkdir(join(creds, 'dir.nk'))
-      unusable('dir')
+    test('a directory at natter.nk is refused, even on loopback', async () => {
+      const dir = await project('creds-dir')
+      await mkdir(join(dir, 'natter.nk'))
+      unusable(dir)
     })
 
     test.skipIf(process.getuid?.() === 0)(
       'a file without read permission is refused, even on loopback',
       async () => {
-        await writeFile(join(creds, 'locked.nk'), 'SUAFAKE')
-        await chmod(join(creds, 'locked.nk'), 0o000)
-        unusable('locked')
+        const dir = await project('creds-locked')
+        await writeFile(join(dir, 'natter.nk'), 'SUAFAKE')
+        await chmod(join(dir, 'natter.nk'), 0o000)
+        unusable(dir)
       },
     )
   })

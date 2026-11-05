@@ -56,6 +56,7 @@ export function startConnection(
     log(transport.refused)
     return conn
   }
+  if (transport.seedWarning) log(transport.seedWarning)
   connect(connectOptions(config, transport)).then(
     (nc) => {
       conn.nc = nc

@@ -261,6 +261,7 @@ async function main(): Promise<void> {
   const config = adminConfig(process.env)
   const transport = resolveTransport(config)
   if ('refused' in transport) throw new Error(transport.refused)
+  if (transport.seedWarning) console.error(transport.seedWarning)
 
   const nc = await connect({
     ...connectOptions(config, transport),

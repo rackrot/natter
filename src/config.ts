@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -16,6 +16,7 @@ const DAY_MS = 24 * 60 * 60 * 1000
 /** How long NATTER_RESULTS keeps a result, so what a record can still prove. */
 export const RESULTS_MAX_AGE_MS = 14 * DAY_MS
 const ADMIN_NAME = 'admin'
+const SEED_FILE = 'natter.nk'
 // Shutdown must finish well inside the 3s the plugin promises on stdin close.
 export const SHUTDOWN_DEADLINE_MS = 2000
 const ACK_WAIT_MS = 120_000
@@ -61,8 +62,8 @@ export type Env = Record<string, string | undefined>
 // Empty counts as unset: unset `userConfig` values substitute as ''.
 const get = (env: Env, key: string) => env[key] || undefined
 
-// A name picks the seed file, so a session must not resolve to an identity
-// above its role. Bootstrap reaches `admin` through adminConfig instead.
+// Reserved so a session cannot take the bootstrap identity's name or a
+// worker the orchestrator's.
 const isReserved = (role: Role, name: string) =>
   name === ADMIN_NAME || (role === 'worker' && name === 'orchestrator')
 
@@ -80,7 +81,7 @@ function expandHome(path: string): string {
     : path
 }
 
-function connectionSettings(env: Env, name: string) {
+function connectionSettings(env: Env) {
   const credsDir = expandHome(
     get(env, 'NATTER_CREDS_DIR') ??
       get(env, 'NATTER_UC_CREDS_DIR') ??
@@ -89,8 +90,8 @@ function connectionSettings(env: Env, name: string) {
   return {
     url:
       get(env, 'NATTER_URL') ?? get(env, 'NATTER_UC_URL') ?? DEFAULT_NATS_URL,
-    // Callers pass a validated name, so it cannot steer this path elsewhere.
-    seedPath: join(credsDir, `${name}.nk`),
+    // One shared seed for every session and bootstrap.
+    seedPath: join(credsDir, SEED_FILE),
     caFile: get(env, 'NATTER_CA_FILE') ?? get(env, 'NATTER_UC_CA_FILE'),
     allowPlaintext: get(env, 'NATTER_ALLOW_PLAINTEXT') === '1',
   }
@@ -158,20 +159,20 @@ export function resolveConfig(env: Env): Resolved {
   }
 
   return {
-    config: { role, name, description, ...connectionSettings(env, name) },
+    config: { role, name, description, ...connectionSettings(env) },
   }
 }
 
 /**
- * The admin identity (plan 3.6), for bootstrap only: seed at
- * `<creds dir>/admin.nk`, regardless of any session name in the environment.
+ * The identity bootstrap runs as, regardless of any session name in the
+ * environment. It shares the seed of every session.
  */
 export function adminConfig(env: Env): Config {
   return {
     role: 'orchestrator',
     name: ADMIN_NAME,
     description: '',
-    ...connectionSettings(env, ADMIN_NAME),
+    ...connectionSettings(env),
   }
 }
 
@@ -224,6 +225,8 @@ export type Transport =
       address: string
       tls: boolean
       seed: Buffer | undefined
+      /** Set when the seed file is readable by group or others. Holds no seed content. */
+      seedWarning: string | undefined
     }
 
 // The client ignores the scheme and dials whatever follows the last `://`, so
@@ -255,8 +258,14 @@ export function resolveTransport(config: Config): Transport {
   const address = port ? `${host}:${port}` : host
 
   let seed: Buffer | undefined
+  let seedWarning: string | undefined
   try {
-    seed = readFileSync(config.seedPath)
+    // Surrounding whitespace is not part of the seed, and an empty file is no seed.
+    const text = readFileSync(config.seedPath).toString().trim()
+    seed = text ? Buffer.from(text) : undefined
+    if (statSync(config.seedPath).mode & 0o077) {
+      seedWarning = `seed ${config.seedPath} is readable by group or others; chmod 600 it`
+    }
   } catch (err) {
     const { code } = err as NodeJS.ErrnoException
     if (code !== 'ENOENT') {
@@ -277,5 +286,5 @@ export function resolveTransport(config: Config): Transport {
       }
     }
   }
-  return { url: `${scheme}://${address}`, address, tls, seed }
+  return { url: `${scheme}://${address}`, address, tls, seed, seedWarning }
 }
