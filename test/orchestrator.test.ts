@@ -507,6 +507,7 @@ test('only the orchestrator role has the orchestrator tools', async () => {
     'list_tasks',
     'list_workers',
     'send_task',
+    'status_page',
   ])
   expect(await names(worker)).toEqual(['finish_task', 'update_task'])
   expect(await names(inert)).toEqual([])

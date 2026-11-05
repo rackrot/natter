@@ -516,9 +516,9 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 ### S13. Status page
 
-- Files: `src/status-page.ts`, `src/orchestrator.ts`, `src/server.ts`, `commands/status.md`, `test/status-page.test.ts`.
+- Files: `src/status-page.ts`, `src/orchestrator.ts`, `commands/status.md`, `test/status-page.test.ts`.
 - Depends on: S7, S9.
-- Design: the orchestrator server starts `Bun.serve` on `127.0.0.1` with port 0, after the NATS connection is up and in the orchestrator role only. It reads through the same trusted readers as `list_tasks` and `list_workers`, so a worker cannot forge what the page shows. Read-only: GET only, and it never publishes. The page polls one JSON endpoint and shows workers and liveness, queue depth per worker, open and recent tasks, and stream usage.
+- Design: the orchestrator server starts `Bun.serve` on `127.0.0.1` with port 0, when the orchestrator role starts. Until NATS is connected the JSON endpoint answers with an error. It reads through the same trusted readers as `list_tasks` and `list_workers`, so a worker cannot forge what the page shows. Read-only: GET only, and it never publishes. The page polls one JSON endpoint and shows workers and liveness, queue depth per worker, open and recent tasks, and stream usage.
 - Finding the port: a new tool `status_page` returns the URL. `commands/status.md` lists that tool as `mcp__plugin_nats-channel_nats-channel__status_page` in `allowed-tools` and tells Claude to call it and open the URL with `xdg-open` or `open`.
 - Security: task content on a loopback port is readable by other local processes, and any web page can reach loopback from a browser. So: a random token per process in the URL, required on every request; reject any `Host` header that is not the loopback address and port, which stops DNS rebinding; no CORS headers; `Content-Security-Policy: default-src 'self'`, no inline script. All worker text is untrusted, so it renders with `textContent` only, never as HTML.
 - Acceptance: the tool lists only for the orchestrator; a wrong token or `Host` is refused; a forged result and a back-dated row do not appear; a hostile summary renders as text; a non-GET is refused; the server stops within the shutdown deadline; NATS down shows an error state rather than stale data as current.
