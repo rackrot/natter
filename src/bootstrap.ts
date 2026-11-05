@@ -12,18 +12,10 @@ import { connect, nanos } from '@nats-io/transport-node'
 import { adminConfig, RESULTS_MAX_AGE_MS, resolveTransport } from './config'
 import { connectOptions } from './connection'
 import {
+  type FleetScope,
+  fleetScope,
   MAX_MESSAGE_BYTES,
   PRESENCE_MAX_BYTES,
-  PRESENCE_STREAM_NAME,
-  PRESENCE_SUBJECTS,
-  RESULT_SUBJECTS,
-  RESULTS_STREAM_NAME,
-  SENT_STREAM_NAME,
-  SENT_SUBJECTS,
-  STATE_STREAM_NAME,
-  STATUS_SUBJECTS,
-  TASK_SUBJECTS,
-  TASKS_STREAM_NAME,
 } from './protocol'
 
 // Admin-only: creates or reconciles the five streams (plan 3.3). Workers
@@ -54,9 +46,9 @@ export type ManagedStream = Pick<
   | 'max_bytes'
 >
 
-export const TASKS_STREAM: ManagedStream = {
-  name: TASKS_STREAM_NAME,
-  subjects: [TASK_SUBJECTS],
+const tasksStream = (scope: FleetScope): ManagedStream => ({
+  name: scope.streams.tasks,
+  subjects: [scope.subjects.task],
   retention: RetentionPolicy.Workqueue,
   storage: StorageType.File,
   max_age: nanos(7 * DAY_MS),
@@ -67,15 +59,15 @@ export const TASKS_STREAM: ManagedStream = {
   allow_direct: false,
   max_msg_size: MAX_MESSAGE_BYTES,
   max_bytes: TASKS_MAX_BYTES,
-}
+})
 
 // First-result-wins is enforced here: a recorded result refuses every later
 // message on its subject until max_age, however it is published, because ACLs
 // cannot require the lastSubjectSequence: 0 header. A full stream rejects new
 // results rather than evicting recorded ones.
-export const RESULTS_STREAM: ManagedStream = {
-  name: RESULTS_STREAM_NAME,
-  subjects: [RESULT_SUBJECTS],
+const resultsStream = (scope: FleetScope): ManagedStream => ({
+  name: scope.streams.results,
+  subjects: [scope.subjects.result],
   retention: RetentionPolicy.Limits,
   storage: StorageType.File,
   max_age: nanos(RESULTS_MAX_AGE_MS),
@@ -86,13 +78,13 @@ export const RESULTS_STREAM: ManagedStream = {
   allow_direct: true,
   max_msg_size: MAX_MESSAGE_BYTES,
   max_bytes: RESULTS_MAX_BYTES,
-}
+})
 
 // Status is a core publish the stream captures, `delivered` a JetStream one;
 // the newest replaces the previous one.
-export const STATE_STREAM: ManagedStream = {
-  name: STATE_STREAM_NAME,
-  subjects: [STATUS_SUBJECTS],
+const stateStream = (scope: FleetScope): ManagedStream => ({
+  name: scope.streams.state,
+  subjects: [scope.subjects.status],
   retention: RetentionPolicy.Limits,
   storage: StorageType.File,
   max_age: nanos(14 * DAY_MS),
@@ -103,16 +95,16 @@ export const STATE_STREAM: ManagedStream = {
   allow_direct: true,
   max_msg_size: MAX_MESSAGE_BYTES,
   max_bytes: STATE_MAX_BYTES,
-}
+})
 
 // Heartbeats, apart from status rows so a flood of those cannot evict one. A
 // worker's ACL allows publishing only its own subject and each keeps one
 // message, so no worker can push out another's with a publish. The reply route
-// of plan 3.6 is the open exception. Comes after NATTER_STATE in STREAMS: a server
+// of plan 3.6 is the open exception. Comes after the state stream in `streamsFor`: a server
 // with presence still on that stream has to give the subject up first.
-export const PRESENCE_STREAM: ManagedStream = {
-  name: PRESENCE_STREAM_NAME,
-  subjects: [PRESENCE_SUBJECTS],
+const presenceStream = (scope: FleetScope): ManagedStream => ({
+  name: scope.streams.presence,
+  subjects: [scope.subjects.presence],
   retention: RetentionPolicy.Limits,
   storage: StorageType.File,
   max_age: nanos(14 * DAY_MS),
@@ -123,15 +115,15 @@ export const PRESENCE_STREAM: ManagedStream = {
   allow_direct: true,
   max_msg_size: PRESENCE_MAX_MSG_BYTES,
   max_bytes: PRESENCE_MAX_BYTES,
-}
+})
 
 // The orchestrator's record of each send, what every result is checked against
 // (plan 3.6). Only the orchestrator can publish on it, so nothing is evicted to
-// make room, and it outlives NATTER_RESULTS. Never drop it: every result still
+// make room, and it outlives the results stream. Never drop it: every result still
 // in the durable would then be terminated for having no record.
-export const SENT_STREAM: ManagedStream = {
-  name: SENT_STREAM_NAME,
-  subjects: [SENT_SUBJECTS],
+const sentStream = (scope: FleetScope): ManagedStream => ({
+  name: scope.streams.sent,
+  subjects: [scope.subjects.sent],
   retention: RetentionPolicy.Limits,
   storage: StorageType.File,
   max_age: nanos(30 * DAY_MS),
@@ -142,18 +134,20 @@ export const SENT_STREAM: ManagedStream = {
   allow_direct: true,
   max_msg_size: MAX_MESSAGE_BYTES,
   max_bytes: SENT_MAX_BYTES,
-}
+})
 
-export const STREAMS = Object.freeze([
-  TASKS_STREAM,
-  RESULTS_STREAM,
-  STATE_STREAM,
-  PRESENCE_STREAM,
-  SENT_STREAM,
-])
-for (const stream of STREAMS) {
-  Object.freeze(stream.subjects)
-  Object.freeze(stream)
+/** The five streams of one fleet, in the order a server needs them. */
+export const streamsFor = (fleet: string): readonly ManagedStream[] => {
+  const scope = fleetScope(fleet)
+  return Object.freeze(
+    [tasksStream, resultsStream, stateStream, presenceStream, sentStream].map(
+      (build) => {
+        const stream = build(scope)
+        Object.freeze(stream.subjects)
+        return Object.freeze(stream)
+      },
+    ),
+  )
 }
 
 /**
@@ -188,7 +182,7 @@ export const diff = (want: ManagedStream, have: StreamConfig) =>
  */
 export async function bootstrapStreams(
   jsm: JetStreamManager,
-  wanted: readonly ManagedStream[] = STREAMS,
+  wanted: readonly ManagedStream[],
 ): Promise<StreamOutcome[]> {
   const found = await Promise.all(
     wanted.map(async (want) => {
@@ -270,7 +264,10 @@ async function main(): Promise<void> {
     maxReconnectAttempts: 0,
   })
   try {
-    const outcomes = await bootstrapStreams(await jetstreamManager(nc))
+    const outcomes = await bootstrapStreams(
+      await jetstreamManager(nc),
+      streamsFor(config.fleet),
+    )
     console.log(`streams on ${transport.address}:`)
     for (const { name, action, changed, messages } of outcomes) {
       const settings = changed.length ? ` (${changed.join(', ')})` : ''

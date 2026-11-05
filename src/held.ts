@@ -8,6 +8,7 @@ import {
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
+import { FLEET_PATTERN } from './config'
 import { HeldSchema } from './protocol'
 
 // The worker server writes the task it holds here and the permission hooks
@@ -25,9 +26,11 @@ const pathFor = (sessionId: unknown) =>
     : undefined
 
 // The server's NATS settings come from plugin.json's env, which the hooks do
-// not get. Paths and the URL only: never the seed itself.
+// not get, and neither the fleet. Paths, the URL and the fleet only: never
+// the seed itself.
 export const HeldFileSchema = z.object({
   held: HeldSchema,
+  fleet: z.string().regex(FLEET_PATTERN),
   url: z.string(),
   seed_path: z.string(),
   ca_file: z.string().optional(),

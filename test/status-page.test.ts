@@ -17,16 +17,15 @@ import {
   jetstreamManager,
 } from '@nats-io/jetstream'
 import { connect, type NatsConnection } from '@nats-io/transport-node'
-import { bootstrapStreams } from '../src/bootstrap'
 import { SHUTDOWN_DEADLINE_MS } from '../src/config'
+import { encodeEnvelope, mintTaskId } from '../src/protocol'
 import {
-  encodeEnvelope,
-  mintTaskId,
+  bootstrapStreams,
   presenceSubject,
   resultSubject,
   sentSubject,
   statusSubject,
-} from '../src/protocol'
+} from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
 import { presenceBytes, seen } from './support/presence'
 import { callTool, type Session, startSession } from './support/session'
@@ -153,7 +152,7 @@ const record = async (to: string, title?: string) => {
 const reflect = async (body: Uint8Array, target: string) => {
   const own = statusSubject('mallory', mintTaskId())
   await js.publish(own, body)
-  nc.publish(`$JS.API.DIRECT.GET.NATTER_STATE.${own}`, undefined, {
+  nc.publish(`$JS.API.DIRECT.GET.NATTER_DEFAULT_STATE.${own}`, undefined, {
     reply: target,
   })
   await nc.flush()
@@ -197,11 +196,11 @@ beforeEach(async () => {
   )
   await Promise.all(
     [
-      'NATTER_TASKS',
-      'NATTER_RESULTS',
-      'NATTER_STATE',
-      'NATTER_PRESENCE',
-      'NATTER_SENT',
+      'NATTER_DEFAULT_TASKS',
+      'NATTER_DEFAULT_RESULTS',
+      'NATTER_DEFAULT_STATE',
+      'NATTER_DEFAULT_PRESENCE',
+      'NATTER_DEFAULT_SENT',
     ].map((stream) => jsm.streams.purge(stream)),
   )
 })
@@ -331,11 +330,11 @@ test('shows workers, task states including waiting_permission, queue depth and s
   const url = await orchestratorPage()
   void worker
 
-  // The record exists but no task is in NATTER_TASKS, so a task reads as lost
+  // The record exists but no task is in NATTER_DEFAULT_TASKS, so a task reads as lost
   // unless it is queued: put the two open ones there.
   for (const task_id of [waiting, queued]) {
     await js.publish(
-      `natter.task.${name}`,
+      `natter.default.task.${name}`,
       encoded({
         v: 1,
         type: 'task',
@@ -361,13 +360,15 @@ test('shows workers, task states including waiting_permission, queue depth and s
   expect(taskOf(data, queued)?.state).toBe('queued')
   expect(taskOf(data, finished)?.state).toBe('finished')
   expect(data.streams.map((s) => s.name).sort()).toEqual([
-    'NATTER_PRESENCE',
-    'NATTER_RESULTS',
-    'NATTER_SENT',
-    'NATTER_STATE',
-    'NATTER_TASKS',
+    'NATTER_DEFAULT_PRESENCE',
+    'NATTER_DEFAULT_RESULTS',
+    'NATTER_DEFAULT_SENT',
+    'NATTER_DEFAULT_STATE',
+    'NATTER_DEFAULT_TASKS',
   ])
-  expect(data.streams.find((s) => s.name === 'NATTER_SENT')?.messages).toBe(3)
+  expect(
+    data.streams.find((s) => s.name === 'NATTER_DEFAULT_SENT')?.messages,
+  ).toBe(3)
 })
 
 test('a forged result, a forged worker and a back-dated result do not appear', async () => {
@@ -393,7 +394,7 @@ test('a forged result, a forged worker and a back-dated result do not appear', a
   await js.publish(sentSubject(backdated), recordBytes(name, backdated))
   await until(
     async () =>
-      (await jsm.streams.info('NATTER_PRESENCE')).state.messages === 1,
+      (await jsm.streams.info('NATTER_DEFAULT_PRESENCE')).state.messages === 1,
   )
 
   const data = await snapshot(url)

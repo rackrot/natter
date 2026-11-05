@@ -16,19 +16,17 @@ import {
   jetstreamManager,
 } from '@nats-io/jetstream'
 import { connect, type NatsConnection } from '@nats-io/transport-node'
-import { bootstrapStreams } from '../src/bootstrap'
 import { NATS_UNAVAILABLE, UNKNOWN_WORKER } from '../src/orchestrator'
+import { encodeEnvelope, mintTaskId, type Task } from '../src/protocol'
+import { ALREADY_RECORDED } from '../src/worker'
 import {
-  encodeEnvelope,
-  mintTaskId,
+  bootstrapStreams,
   presenceSubject,
   resultSubject,
   sentSubject,
   statusSubject,
-  type Task,
   taskSubject,
-} from '../src/protocol'
-import { ALREADY_RECORDED } from '../src/worker'
+} from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
 import { presenceBytes, seen } from './support/presence'
 import { callTool, type Session, startSession } from './support/session'
@@ -93,7 +91,7 @@ const encoded = (envelope: unknown) => {
 const reflect = async (body: Uint8Array, target: string) => {
   const own = statusSubject('mallory', mintTaskId())
   await js.publish(own, body)
-  nc.publish(`$JS.API.DIRECT.GET.NATTER_STATE.${own}`, undefined, {
+  nc.publish(`$JS.API.DIRECT.GET.NATTER_DEFAULT_STATE.${own}`, undefined, {
     reply: target,
   })
   await nc.flush()
@@ -175,7 +173,7 @@ const rowBytes = (
 const consumerDone = (worker: string) =>
   until(async () => {
     const info = await jsm.consumers
-      .info('NATTER_TASKS', `task-${worker}`)
+      .info('NATTER_DEFAULT_TASKS', `task-${worker}`)
       .catch(() => undefined)
     return (
       info !== undefined &&
@@ -186,7 +184,7 @@ const consumerDone = (worker: string) =>
   })
 
 const taskCount = async () =>
-  (await jsm.streams.info('NATTER_TASKS')).state.messages
+  (await jsm.streams.info('NATTER_DEFAULT_TASKS')).state.messages
 
 const attention = (s: Session) =>
   s.pushes.filter((push) => push.meta.kind === 'attention')
@@ -218,14 +216,16 @@ beforeEach(async () => {
       () => false,
     ),
   )
-  await jsm.consumers.delete('NATTER_RESULTS', 'results').catch(() => {})
+  await jsm.consumers
+    .delete('NATTER_DEFAULT_RESULTS', 'results')
+    .catch(() => {})
   await Promise.all(
     [
-      'NATTER_TASKS',
-      'NATTER_RESULTS',
-      'NATTER_STATE',
-      'NATTER_PRESENCE',
-      'NATTER_SENT',
+      'NATTER_DEFAULT_TASKS',
+      'NATTER_DEFAULT_RESULTS',
+      'NATTER_DEFAULT_STATE',
+      'NATTER_DEFAULT_PRESENCE',
+      'NATTER_DEFAULT_SENT',
     ].map((stream) => jsm.streams.purge(stream)),
   )
 })
@@ -251,7 +251,10 @@ test('a forged task is terminated, pushed to nobody, and gets no result', async 
   expect(worker.pushes).toEqual([])
   expect(await taskCount()).toBe(0)
   expect(
-    await storedOn('NATTER_RESULTS', resultSubject(name, forged.task_id)),
+    await storedOn(
+      'NATTER_DEFAULT_RESULTS',
+      resultSubject(name, forged.task_id),
+    ),
   ).toBeNull()
 
   const real = taskEnvelope(name)
@@ -279,7 +282,7 @@ test('a forged record is no record', async () => {
   const orchestrator = await startOrchestrator()
 
   await reflect(recordBytes(name, task_id), sentSubject(task_id))
-  await landed('NATTER_SENT', sentSubject(task_id))
+  await landed('NATTER_DEFAULT_SENT', sentSubject(task_id))
 
   const reply = await callTool(orchestrator, 'get_result', { task_id })
   expect(reply.isError).toBe(true)
@@ -298,7 +301,7 @@ test('a forged record makes no name addressable', async () => {
   const orchestrator = await startOrchestrator()
 
   await reflect(recordBytes(ghost, task_id), sentSubject(task_id))
-  await landed('NATTER_SENT', sentSubject(task_id))
+  await landed('NATTER_DEFAULT_SENT', sentSubject(task_id))
 
   const reply = await refused(orchestrator, ghost)
   expect(reply.isError).toBe(true)
@@ -310,13 +313,13 @@ test('forged presence shows no worker and makes no name addressable', async () =
   const orchestrator = await startOrchestrator()
 
   await reflect(presenceBytes(ghost), presenceSubject(ghost))
-  await landed('NATTER_PRESENCE', presenceSubject(ghost))
+  await landed('NATTER_DEFAULT_PRESENCE', presenceSubject(ghost))
 
   const { workers } = await toolJson(orchestrator, 'list_workers')
   expect(workers).toEqual([])
   const reply = await refused(orchestrator, ghost)
   expect(reply.content[0]?.text).toBe(UNKNOWN_WORKER)
-  expect((await jsm.streams.info('NATTER_SENT')).state.messages).toBe(0)
+  expect((await jsm.streams.info('NATTER_DEFAULT_SENT')).state.messages).toBe(0)
 })
 
 test('forged presence does not keep a dead worker alive', async () => {
@@ -348,9 +351,9 @@ test('a forged result closes nothing and pushes nothing', async () => {
   const orchestrator = await startOrchestrator()
 
   await reflect(resultBytes(name, task_id), resultSubject(name, task_id))
-  await landed('NATTER_RESULTS', resultSubject(name, task_id))
+  await landed('NATTER_DEFAULT_RESULTS', resultSubject(name, task_id))
   await until(async () => {
-    const info = await jsm.consumers.info('NATTER_RESULTS', 'results')
+    const info = await jsm.consumers.info('NATTER_DEFAULT_RESULTS', 'results')
     return info.delivered.stream_seq >= 1 && info.num_ack_pending === 0
   })
 
@@ -368,7 +371,7 @@ test('a forged row raises no attention', async () => {
     rowBytes(name, task_id, 'released'),
     statusSubject(name, task_id),
   )
-  await landed('NATTER_STATE', statusSubject(name, task_id))
+  await landed('NATTER_DEFAULT_STATE', statusSubject(name, task_id))
 
   const orchestrator = await startOrchestrator()
   await Bun.sleep(SWEEPS_MS)
@@ -384,7 +387,7 @@ test('a forged result does not get a worker to drop its task', async () => {
     resultBytes(name, task.task_id),
     resultSubject(name, task.task_id),
   )
-  await landed('NATTER_RESULTS', resultSubject(name, task.task_id))
+  await landed('NATTER_DEFAULT_RESULTS', resultSubject(name, task.task_id))
 
   const worker = await startWorker(name)
 
@@ -408,14 +411,14 @@ test('a forged result with the instance of the worker is not its finish_task', a
   const worker = await startWorker(name)
   await js.publish(taskSubject(name), JSON.stringify(task))
   await until(async () => worker.pushes.length === 1)
-  const beat = await storedOn('NATTER_PRESENCE', presenceSubject(name))
+  const beat = await storedOn('NATTER_DEFAULT_PRESENCE', presenceSubject(name))
   const { instance } = beat?.json<{ instance: string }>() ?? {}
 
   await reflect(
     resultBytes(name, task.task_id, instance),
     resultSubject(name, task.task_id),
   )
-  await landed('NATTER_RESULTS', resultSubject(name, task.task_id))
+  await landed('NATTER_DEFAULT_RESULTS', resultSubject(name, task.task_id))
 
   const reply = await callTool(worker, 'finish_task', {
     task_id: task.task_id,
@@ -433,7 +436,7 @@ test('a forged row does not use up attempts', async () => {
     rowBytes(name, task.task_id, 'released', 9),
     statusSubject(name, task.task_id),
   )
-  await landed('NATTER_STATE', statusSubject(name, task.task_id))
+  await landed('NATTER_DEFAULT_STATE', statusSubject(name, task.task_id))
 
   const worker = await startWorker(name)
 

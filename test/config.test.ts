@@ -1,16 +1,27 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from 'bun:test'
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   adminConfig,
   type Config,
+  DEFAULT_FLEET,
+  FLEET_PATTERN,
   resolveConfig,
   resolveLimits,
   resolveTransport,
 } from '../src/config'
 import { startConnection } from '../src/connection'
 import { startSession } from './support/session'
+
+setDefaultTimeout(15_000)
 
 let root: string
 const project = async (dir: string, natterJson?: unknown) => {
@@ -96,6 +107,42 @@ describe('name precedence', () => {
     const dir = await project('described', { description: 'does things' })
     const r = resolveConfig({ NATTER_ROLE: 'worker', CLAUDE_PROJECT_DIR: dir })
     expect(r).toHaveProperty('config.description', 'does things')
+  })
+})
+
+describe('fleet', () => {
+  const base = { NATTER_ROLE: 'worker', NATTER_NAME: 'w' }
+  const fleetOf = (env: Record<string, string>) =>
+    (resolveConfig({ ...base, ...env }) as { config: Config }).config.fleet
+
+  test('unset and empty give the default fleet', () => {
+    expect(fleetOf({})).toBe(DEFAULT_FLEET)
+    expect(fleetOf({ NATTER_FLEET: '' })).toBe(DEFAULT_FLEET)
+    expect(adminConfig({}).fleet).toBe(DEFAULT_FLEET)
+  })
+
+  test('NATTER_FLEET sets it, for sessions and bootstrap', () => {
+    expect(fleetOf({ NATTER_FLEET: 'a-1' })).toBe('a-1')
+    expect(adminConfig({ NATTER_FLEET: 'a-1' }).fleet).toBe('a-1')
+  })
+
+  test.each(['X', 'a_b', '-a', 'a.b', 'a b', 'x'.repeat(33)])(
+    'an invalid name %p is inert, and bootstrap throws',
+    (fleet) => {
+      expect(resolveConfig({ ...base, NATTER_FLEET: fleet })).toHaveProperty(
+        'inert',
+      )
+      expect(() => adminConfig({ NATTER_FLEET: fleet })).toThrow()
+    },
+  )
+
+  test('the longest name matches the pattern', () => {
+    expect(FLEET_PATTERN.test('x'.repeat(32))).toBe(true)
+  })
+
+  test('.claude/natter.json cannot set it', async () => {
+    const dir = await project('fleet-file', { name: 'w', fleet: 'other' })
+    expect(fleetOf({ CLAUDE_PROJECT_DIR: dir })).toBe(DEFAULT_FLEET)
   })
 })
 

@@ -1,8 +1,5 @@
-import {
-  encodeEnvelope,
-  type Presence,
-  presenceSubject,
-} from '../../src/protocol'
+import { encodeEnvelope, type Presence } from '../../src/protocol'
+import { presenceSubject } from './fleet'
 
 /** A heartbeat as a worker would write it, with only `fields` set by the test. */
 export function presenceBytes(worker: string, fields: Partial<Presence> = {}) {

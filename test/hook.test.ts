@@ -12,15 +12,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { jetstream, jetstreamManager } from '@nats-io/jetstream'
 import { connect, type NatsConnection } from '@nats-io/transport-node'
-import { bootstrapStreams } from '../src/bootstrap'
 import type { HeldFile } from '../src/held'
-import {
-  encodeEnvelope,
-  mintTaskId,
-  parseMessage,
-  sentSubject,
-  statusSubject,
-} from '../src/protocol'
+import { encodeEnvelope, mintTaskId, parseMessage } from '../src/protocol'
+import { bootstrapStreams, sentSubject, statusSubject } from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
 import { seen } from './support/presence'
 import { callTool, type Session, startSession } from './support/session'
@@ -142,8 +136,10 @@ async function runHook({
   mode = 'permission',
   env,
   stdin,
+  fleet = 'default',
 }: {
   name: string
+  fleet?: string
   mode?: 'permission' | 'resumed' | 'error'
   env: Record<string, string>
   stdin: unknown
@@ -151,7 +147,7 @@ async function runHook({
   const writes: string[] = []
   const notes: unknown[] = []
   const raw: string[] = []
-  const sub = nc.subscribe(`natter.status.${name}.*`, {
+  const sub = nc.subscribe(`natter.${fleet}.status.${name}.*`, {
     callback: (_err, msg) => {
       const parsedMsg = parseMessage(msg.subject, msg.data)
       if (parsedMsg.ok && parsedMsg.envelope.type === 'status') {
@@ -388,6 +384,7 @@ test('no role, no held task, NATS down or bad input exits 0 in time and writes n
       instance: mintTaskId(),
       attempt: 1,
     },
+    fleet: 'default',
     url: down.url,
     seed_path: join(NO_CREDS, 'natter.nk'),
   })
@@ -407,6 +404,76 @@ test('no role, no held task, NATS down or bad input exits 0 in time and writes n
     expect(run).toMatchObject({ code: 0, printed: '', writes: [] })
     expect(run.ms).toBeLessThan(HOOK_BOUND_MS)
   }
+})
+
+test('a hook publishes on the fleet its held file names, and on no other', async () => {
+  const name = `w-${crypto.randomUUID()}`
+  const planted = async (fleet: string) => {
+    const sessionId = crypto.randomUUID()
+    await plantHeld(sessionId, {
+      held: {
+        task_id: mintTaskId(),
+        title: 't',
+        created_at: new Date().toISOString(),
+        depth: 0,
+        timeout_s: 60,
+        queue_ttl_s: 60,
+        instance: mintTaskId(),
+        attempt: 1,
+      },
+      fleet,
+      url: nats.url,
+      seed_path: join(NO_CREDS, 'natter.nk'),
+    })
+    return sessionId
+  }
+  const sessionId = await planted('x')
+  const [onX, onDefault] = await Promise.all([
+    runHook({
+      name,
+      fleet: 'x',
+      env: hookEnv(name),
+      stdin: { session_id: sessionId },
+    }),
+    runHook({
+      name,
+      env: hookEnv(name),
+      stdin: { session_id: sessionId },
+    }),
+  ])
+  expect(onX.writes).toContain('waiting_permission')
+  expect(onDefault.writes).toEqual([])
+})
+
+test('a held file without a valid fleet is ignored', async () => {
+  const name = `w-${crypto.randomUUID()}`
+  const sessionId = crypto.randomUUID()
+  const held = {
+    task_id: mintTaskId(),
+    title: 't',
+    created_at: new Date().toISOString(),
+    depth: 0,
+    timeout_s: 60,
+    queue_ttl_s: 60,
+    instance: mintTaskId(),
+    attempt: 1,
+  }
+  const rest = { url: nats.url, seed_path: join(NO_CREDS, 'natter.nk') }
+  await plantHeld(sessionId, { held, ...rest } as HeldFile)
+  const missing = await runHook({
+    name,
+    env: hookEnv(name),
+    stdin: { session_id: sessionId },
+  })
+  await plantHeld(sessionId, { held, fleet: 'Bad_Fleet', ...rest })
+  const invalid = await runHook({
+    name,
+    fleet: 'Bad_Fleet',
+    env: hookEnv(name),
+    stdin: { session_id: sessionId },
+  })
+  expect(missing).toMatchObject({ code: 0, writes: [] })
+  expect(invalid).toMatchObject({ code: 0, writes: [] })
 })
 
 test('the held file is removed on finish and on stop', async () => {
@@ -568,6 +635,7 @@ test('the hook trusts a private CA given only through the held file', async () =
         instance: mintTaskId(),
         attempt: 1,
       },
+      fleet: 'default',
       url: secure.url.replace('nats://', 'tls://'),
       seed_path: join(NO_CREDS, 'natter.nk'),
       ca_file: certFile,

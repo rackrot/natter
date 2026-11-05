@@ -2,7 +2,7 @@ import { existsSync, statSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { type JetStreamManager, jetstreamManager } from '@nats-io/jetstream'
 import { connect, type NatsConnection } from '@nats-io/transport-node'
-import { diff, STREAMS } from './bootstrap'
+import { diff, streamsFor } from './bootstrap'
 import {
   adminConfig,
   type Config,
@@ -10,12 +10,7 @@ import {
   resolveTransport,
 } from './config'
 import { connectOptions } from './connection'
-import {
-  RESULTS_DURABLE,
-  RESULTS_STREAM_NAME,
-  TASKS_STREAM_NAME,
-  workerDurable,
-} from './protocol'
+import { fleetScope, RESULTS_DURABLE, workerDurable } from './protocol'
 
 // Standalone command, not imported by src/server.ts. It connects once and
 // never retries, which a session's silent retry cannot do, so each failure
@@ -83,17 +78,23 @@ async function run(env: NodeJS.ProcessEnv): Promise<Check[]> {
   let consumer: { stream: string; durable: string } | undefined
   if ('config' in resolved) {
     config = resolved.config
+    const { streams } = fleetScope(config.fleet)
     consumer =
       config.role === 'orchestrator'
-        ? { stream: RESULTS_STREAM_NAME, durable: RESULTS_DURABLE }
-        : { stream: TASKS_STREAM_NAME, durable: workerDurable(config.name) }
+        ? { stream: streams.results, durable: RESULTS_DURABLE }
+        : { stream: streams.tasks, durable: workerDurable(config.name) }
     checks.push({
       name: 'config',
       status: 'pass',
       detail: `${config.role} ${config.name}`,
     })
   } else {
-    config = adminConfig(env)
+    try {
+      config = adminConfig(env)
+    } catch (err) {
+      // An invalid fleet: nothing below can name a stream.
+      return [{ name: 'config', status: 'fail', detail: reason(err) }]
+    }
     const noRole = !env.NATTER_ROLE
     checks.push({
       name: 'config',
@@ -169,7 +170,7 @@ async function run(env: NodeJS.ProcessEnv): Promise<Check[]> {
       const { streams } = await jsm.getAccountInfo()
       return `${streams} streams in the account`
     })
-    for (const want of STREAMS) {
+    for (const want of streamsFor(config.fleet)) {
       await check(`stream ${want.name}`, async () => {
         const info = await (jsm as JetStreamManager).streams
           .info(want.name)

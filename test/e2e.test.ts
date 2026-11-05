@@ -15,15 +15,14 @@ import {
   jetstreamManager,
 } from '@nats-io/jetstream'
 import { connect, type NatsConnection } from '@nats-io/transport-node'
-import { bootstrapStreams } from '../src/bootstrap'
 import { NATS_UNAVAILABLE } from '../src/orchestrator'
+import { encodeEnvelope, mintTaskId } from '../src/protocol'
 import {
-  encodeEnvelope,
-  mintTaskId,
+  bootstrapStreams,
   presenceSubject,
   resultSubject,
   taskSubject,
-} from '../src/protocol'
+} from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
 import { seen } from './support/presence'
 import {
@@ -74,7 +73,7 @@ const answer = (reply: ToolReply) => {
 
 const queued = async (worker: string) => {
   const subject = taskSubject(worker)
-  const info = await jsm.streams.info('NATTER_TASKS', {
+  const info = await jsm.streams.info('NATTER_DEFAULT_TASKS', {
     subjects_filter: subject,
   })
   return info.state.subjects?.[subject] ?? 0
@@ -83,7 +82,7 @@ const queued = async (worker: string) => {
 /** send_task refuses a name until the worker's first heartbeat is stored. */
 const heardFrom = (worker: string) =>
   until(async () => {
-    const msg = await jsm.direct.getMessage('NATTER_PRESENCE', {
+    const msg = await jsm.direct.getMessage('NATTER_DEFAULT_PRESENCE', {
       last_by_subj: presenceSubject(worker),
     })
     return msg !== null
@@ -245,7 +244,10 @@ test('a forger holding the real id cannot hold off the honest result', async () 
   expect((await pushed(orchestrator, 1))?.content).toBe('the honest one')
   expect(orchestrator.pushes[0]?.meta.worker).toBe(name)
   expect(await queued(name)).toBe(0)
-  const consumer = await jsm.consumers.info('NATTER_TASKS', `task-${name}`)
+  const consumer = await jsm.consumers.info(
+    'NATTER_DEFAULT_TASKS',
+    `task-${name}`,
+  )
   expect(consumer.num_ack_pending).toBe(0)
   expect(
     answer(await callTool(orchestrator, 'get_result', { task_id })),

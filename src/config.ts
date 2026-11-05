@@ -3,6 +3,9 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 
 export const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/
+/** No `_`, so a fleet reads cleanly in `NATTER_<FLEET>_TASKS`. */
+export const FLEET_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/
+export const DEFAULT_FLEET = 'default'
 export const MAX_DESCRIPTION_BYTES = 512
 export const MAX_TIMEOUT_S = 86400
 export const DEFAULT_NATS_URL = 'nats://127.0.0.1:4222'
@@ -13,7 +16,7 @@ export const DEFAULT_MAX_ATTEMPTS = 3
 // Past created_at + queue_ttl_s + accept timeout + timeout_s (plan 3.5).
 export const OVERDUE_MARGIN_S = 300
 const DAY_MS = 24 * 60 * 60 * 1000
-/** How long NATTER_RESULTS keeps a result, so what a record can still prove. */
+/** How long the results stream keeps a result, so what a record can still prove. */
 export const RESULTS_MAX_AGE_MS = 14 * DAY_MS
 const ADMIN_NAME = 'admin'
 const SEED_FILE = 'natter.nk'
@@ -49,6 +52,7 @@ export interface Config {
   role: Role
   name: string
   description: string
+  fleet: string
   url: string
   seedPath: string
   caFile: string | undefined
@@ -73,6 +77,14 @@ function sanitizeName(raw: string): string {
     .replace(/[^a-z0-9_-]+/g, '-')
     .replace(/^[^a-z0-9]+/, '')
     .slice(0, 64)
+}
+
+/** From `NATTER_FLEET` only: a committed file must not move a session into another fleet. */
+function resolveFleet(env: Env): { fleet: string } | { invalid: string } {
+  const fleet = get(env, 'NATTER_FLEET') ?? DEFAULT_FLEET
+  return FLEET_PATTERN.test(fleet)
+    ? { fleet }
+    : { invalid: `fleet ${JSON.stringify(fleet)} must match ${FLEET_PATTERN}` }
 }
 
 function expandHome(path: string): string {
@@ -108,6 +120,9 @@ export function resolveConfig(env: Env): Resolved {
   if (role !== 'orchestrator' && role !== 'worker') {
     return { inert: 'NATTER_ROLE is not "orchestrator" or "worker"' }
   }
+
+  const resolved = resolveFleet(env)
+  if ('invalid' in resolved) return { inert: resolved.invalid }
 
   // Never process.cwd(): the plugin runs with its own root as cwd.
   const projectDir = get(env, 'CLAUDE_PROJECT_DIR')
@@ -159,7 +174,13 @@ export function resolveConfig(env: Env): Resolved {
   }
 
   return {
-    config: { role, name, description, ...connectionSettings(env) },
+    config: {
+      role,
+      name,
+      description,
+      fleet: resolved.fleet,
+      ...connectionSettings(env),
+    },
   }
 }
 
@@ -168,10 +189,13 @@ export function resolveConfig(env: Env): Resolved {
  * environment. It shares the seed of every session.
  */
 export function adminConfig(env: Env): Config {
+  const resolved = resolveFleet(env)
+  if ('invalid' in resolved) throw new Error(resolved.invalid)
   return {
     role: 'orchestrator',
     name: ADMIN_NAME,
     description: '',
+    fleet: resolved.fleet,
     ...connectionSettings(env),
   }
 }

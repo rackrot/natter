@@ -23,7 +23,6 @@ import {
   type NatsConnection,
   nanos,
 } from '@nats-io/transport-node'
-import { bootstrapStreams } from '../src/bootstrap'
 import { OVERDUE_MARGIN_S, resolveConfig } from '../src/config'
 import { startConnection } from '../src/connection'
 import { NATS_UNAVAILABLE, UNKNOWN_WORKER } from '../src/orchestrator'
@@ -31,16 +30,19 @@ import {
   encodeEnvelope,
   mintTaskId,
   type Presence,
-  presenceSubject,
-  resultSubject,
   type Sent,
   type Status,
-  sentSubject,
-  statusSubject,
   type Task,
-  taskSubject,
 } from '../src/protocol'
 import { createWorker } from '../src/worker'
+import {
+  bootstrapStreams,
+  presenceSubject,
+  resultSubject,
+  sentSubject,
+  statusSubject,
+  taskSubject,
+} from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
 import { presenceBytes, seen } from './support/presence'
 import {
@@ -289,14 +291,16 @@ beforeEach(async () => {
       () => false,
     ),
   )
-  await jsm.consumers.delete('NATTER_RESULTS', 'results').catch(() => {})
+  await jsm.consumers
+    .delete('NATTER_DEFAULT_RESULTS', 'results')
+    .catch(() => {})
   await Promise.all(
     [
-      'NATTER_TASKS',
-      'NATTER_RESULTS',
-      'NATTER_STATE',
-      'NATTER_PRESENCE',
-      'NATTER_SENT',
+      'NATTER_DEFAULT_TASKS',
+      'NATTER_DEFAULT_RESULTS',
+      'NATTER_DEFAULT_STATE',
+      'NATTER_DEFAULT_PRESENCE',
+      'NATTER_DEFAULT_SENT',
     ].map((stream) => jsm.streams.purge(stream)),
   )
 })
@@ -388,7 +392,7 @@ test('an offline worker still takes tasks, and send_task reports its state', asy
   expect(worker_state).toBe('offline')
   expect(task_id).toBeDefined()
   const subject = taskSubject(name)
-  const info = await jsm.streams.info('NATTER_TASKS', {
+  const info = await jsm.streams.info('NATTER_DEFAULT_TASKS', {
     subjects_filter: subject,
   })
   expect(info.state.subjects?.[subject]).toBe(1)
@@ -581,8 +585,10 @@ test('send_task refuses a name nobody has seen, before any publish', async () =>
   })
 
   expect(reply.isError).toBe(true)
-  expect((await jsm.streams.info('NATTER_SENT')).state.messages).toBe(0)
-  expect((await jsm.streams.info('NATTER_TASKS')).state.messages).toBe(0)
+  expect((await jsm.streams.info('NATTER_DEFAULT_SENT')).state.messages).toBe(0)
+  expect((await jsm.streams.info('NATTER_DEFAULT_TASKS')).state.messages).toBe(
+    0,
+  )
 })
 
 test('a worker with no presence left stays addressable through its records', async () => {
@@ -591,7 +597,7 @@ test('a worker with no presence left stays addressable through its records', asy
   await seen(js, name)
   await send(orchestrator, name)
 
-  await jsm.streams.purge('NATTER_PRESENCE')
+  await jsm.streams.purge('NATTER_DEFAULT_PRESENCE')
 
   const { task_id, worker_state } = await send(orchestrator, name)
   expect(task_id).toBeDefined()
@@ -600,8 +606,11 @@ test('a worker with no presence left stays addressable through its records', asy
 
 test('a status flood leaves presence, the send gate and stale alone', async () => {
   await onFreshServer(async (server, conn, manager) => {
-    const { config } = await manager.streams.info('NATTER_STATE')
-    await manager.streams.update('NATTER_STATE', { ...config, max_msgs: 100 })
+    const { config } = await manager.streams.info('NATTER_DEFAULT_STATE')
+    await manager.streams.update('NATTER_DEFAULT_STATE', {
+      ...config,
+      max_msgs: 100,
+    })
     const flood = (count: number) =>
       Promise.all(
         Array.from({ length: count }, () =>
@@ -670,7 +679,7 @@ test('the look through the records is bounded by the scan cap', async () => {
 
 test('orchestrator and inert sessions publish no presence', async () => {
   const published: string[] = []
-  const sub = nc.subscribe('natter.presence.>', {
+  const sub = nc.subscribe('natter.default.presence.>', {
     callback: (_, msg) => {
       published.push(msg.subject)
     },
@@ -694,7 +703,7 @@ test('heartbeats resume after a reconnect', async () => {
   const conn = await connect({ servers: server.url })
   const manager = await jetstreamManager(conn)
   const lastSeq = async () => {
-    const msg = await manager.direct.getMessage('NATTER_PRESENCE', {
+    const msg = await manager.direct.getMessage('NATTER_DEFAULT_PRESENCE', {
       last_by_subj: presenceSubject(name),
     })
     return msg?.seq ?? 0
@@ -777,7 +786,7 @@ test('a heartbeat that cannot be published does not touch task handling', async 
 
     expect(reply.isError).toBeFalsy()
     expect(failed).toBeGreaterThan(0)
-    const stored = await jsm.direct.getMessage('NATTER_RESULTS', {
+    const stored = await jsm.direct.getMessage('NATTER_DEFAULT_RESULTS', {
       last_by_subj: resultSubject(name, task_id),
     })
     expect(stored).not.toBeNull()
@@ -947,8 +956,8 @@ test('a record past the scan cap raises nothing', async () => {
 test('a record older than the results stream keeps is aged_out and raises nothing', async () => {
   await onFreshServer(async (server, conn, manager) => {
     const maxAge = 1000
-    const { config } = await manager.streams.info('NATTER_RESULTS')
-    await manager.streams.update('NATTER_RESULTS', {
+    const { config } = await manager.streams.info('NATTER_DEFAULT_RESULTS')
+    await manager.streams.update('NATTER_DEFAULT_RESULTS', {
       ...config,
       max_age: nanos(maxAge),
       duplicate_window: nanos(maxAge),
@@ -964,7 +973,7 @@ test('a record older than the results stream keeps is aged_out and raises nothin
 
     await until(
       async () =>
-        (await manager.direct.getMessage('NATTER_RESULTS', {
+        (await manager.direct.getMessage('NATTER_DEFAULT_RESULTS', {
           last_by_subj: resultSubject(name, task_id),
         })) === null,
     )
@@ -1041,8 +1050,11 @@ test('new attention cannot starve a task the cap keeps cutting off', async () =>
 
 test('a flood that evicts the row leaves a dead worker raising stale', async () => {
   await onFreshServer(async (server, conn, manager) => {
-    const { config } = await manager.streams.info('NATTER_STATE')
-    await manager.streams.update('NATTER_STATE', { ...config, max_msgs: 100 })
+    const { config } = await manager.streams.info('NATTER_DEFAULT_STATE')
+    await manager.streams.update('NATTER_DEFAULT_STATE', {
+      ...config,
+      max_msgs: 100,
+    })
     const orchestrator = await startOrchestrator({}, server.url)
     const name = freshName()
     const worker = await startWorker(name, {}, server.url)
@@ -1055,7 +1067,7 @@ test('a flood that evicts the row leaves a dead worker raising stale', async () 
         writeRow('flooder', mintTaskId(), 'accepted', undefined, conn),
       ),
     )
-    const row = await manager.direct.getMessage('NATTER_STATE', {
+    const row = await manager.direct.getMessage('NATTER_DEFAULT_STATE', {
       last_by_subj: statusSubject(name, task_id),
     })
     expect(row).toBeNull()

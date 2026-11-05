@@ -23,18 +23,14 @@ import {
   nanos,
   nuid,
 } from '@nats-io/transport-node'
-import { bootstrapStreams } from '../src/bootstrap'
 import { resolveConfig, resolveTimers } from '../src/config'
 import { startConnection } from '../src/connection'
 import {
   encodeEnvelope,
   type Result,
   ResultSchema,
-  resultSubject,
   type Status,
-  statusSubject,
   type Task,
-  taskSubject,
 } from '../src/protocol'
 import {
   ALREADY_CLOSED,
@@ -43,6 +39,12 @@ import {
   RELEASED,
   type ToolResult,
 } from '../src/worker'
+import {
+  bootstrapStreams,
+  resultSubject,
+  statusSubject,
+  taskSubject,
+} from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
 import { type Push, type Session, startSession } from './support/session'
 
@@ -121,14 +123,14 @@ const publishTask = async (task: Task, js = jetstream(nc)) => {
 
 const queued = async (worker: string, manager = jsm) => {
   const subject = taskSubject(worker)
-  const info = await manager.streams.info('NATTER_TASKS', {
+  const info = await manager.streams.info('NATTER_DEFAULT_TASKS', {
     subjects_filter: subject,
   })
   return info.state.subjects?.[subject] ?? 0
 }
 
 const consumerOf = (worker: string, manager = jsm) =>
-  manager.consumers.info('NATTER_TASKS', `task-${worker}`)
+  manager.consumers.info('NATTER_DEFAULT_TASKS', `task-${worker}`)
 
 const heldBy = (worker: string, manager = jsm) =>
   until(async () =>
@@ -139,7 +141,7 @@ const heldBy = (worker: string, manager = jsm) =>
   )
 
 const storedResult = async (worker: string, taskId: string, manager = jsm) => {
-  const msg = await manager.direct.getMessage('NATTER_RESULTS', {
+  const msg = await manager.direct.getMessage('NATTER_DEFAULT_RESULTS', {
     last_by_subj: resultSubject(worker, taskId),
   })
   return msg ? (msg.json() as Result) : undefined
@@ -147,14 +149,14 @@ const storedResult = async (worker: string, taskId: string, manager = jsm) => {
 
 const resultCount = async (worker: string, taskId: string) => {
   const subject = resultSubject(worker, taskId)
-  const info = await jsm.streams.info('NATTER_RESULTS', {
+  const info = await jsm.streams.info('NATTER_DEFAULT_RESULTS', {
     subjects_filter: subject,
   })
   return info.state.subjects?.[subject] ?? 0
 }
 
 const statusOf = async (worker: string, taskId: string, manager = jsm) => {
-  const msg = await manager.direct.getMessage('NATTER_STATE', {
+  const msg = await manager.direct.getMessage('NATTER_DEFAULT_STATE', {
     last_by_subj: statusSubject(worker, taskId),
   })
   return msg ? (msg.json() as Status) : undefined
@@ -204,7 +206,7 @@ const sigkill = (s: Session) => {
 const watchTerminated = async (worker: string, conn = nc) => {
   const terminated: unknown[] = []
   conn.subscribe(
-    `$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.NATTER_TASKS.task-${worker}`,
+    `$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.NATTER_DEFAULT_TASKS.task-${worker}`,
     {
       callback: (_err, msg) => {
         terminated.push(msg.json())
@@ -223,7 +225,7 @@ const watchWire = async (worker: string, taskId: string) => {
       events.push((msg.json() as Status).state)
     },
   })
-  nc.subscribe(`$JS.ACK.NATTER_TASKS.task-${worker}.>`, {
+  nc.subscribe(`$JS.ACK.NATTER_DEFAULT_TASKS.task-${worker}.>`, {
     callback: (_err, msg) => {
       if (msg.string() === '-NAK') events.push('nak')
       if (msg.string().startsWith('+TERM')) events.push('term')
@@ -290,7 +292,7 @@ const writeStatus = async (
 
 /** Delivers the queued task `times` times to nobody, as a dead standby would. */
 const inflateDeliveries = async (name: string, times: number) => {
-  await jsm.consumers.add('NATTER_TASKS', {
+  await jsm.consumers.add('NATTER_DEFAULT_TASKS', {
     durable_name: `task-${name}`,
     filter_subject: taskSubject(name),
     ack_policy: AckPolicy.Explicit,
@@ -298,7 +300,7 @@ const inflateDeliveries = async (name: string, times: number) => {
     max_ack_pending: 1,
   })
   const consumer = await jetstream(nc).consumers.get(
-    'NATTER_TASKS',
+    'NATTER_DEFAULT_TASKS',
     `task-${name}`,
   )
   for (let i = 0; i < times; i++) {
@@ -328,16 +330,19 @@ const onFreshServer = async (
   }
 }
 
-/** Leaves NATTER_RESULTS with no room; returns how to give the room back. */
+/** Leaves NATTER_DEFAULT_RESULTS with no room; returns how to give the room back. */
 const fillResults = async (js: JetStream, manager: JetStreamManager) => {
-  const { config } = await manager.streams.info('NATTER_RESULTS')
-  await manager.streams.update('NATTER_RESULTS', { ...config, max_msgs: 1 })
+  const { config } = await manager.streams.info('NATTER_DEFAULT_RESULTS')
+  await manager.streams.update('NATTER_DEFAULT_RESULTS', {
+    ...config,
+    max_msgs: 1,
+  })
   await js.publish(resultSubject('filler', nuid.next()), 'taking the slot')
   const refused = await js
     .publish(resultSubject('filler', nuid.next()), 'over')
     .catch((err: { code?: number }) => err.code)
   expect(refused).toBe(STREAM_STORE_FAILED)
-  return () => manager.streams.update('NATTER_RESULTS', config)
+  return () => manager.streams.update('NATTER_DEFAULT_RESULTS', config)
 }
 
 // In-process, because only here can a test sit between two steps of a tool call.
@@ -372,7 +377,7 @@ const inProcessWorker = async (
   }
 }
 
-const RESULT_PUBLISH = 'natter.result.'
+const RESULT_PUBLISH = 'natter.default.result.'
 
 /**
  * Sits on the first request of `conn` to a subject starting with `prefix` until
@@ -593,7 +598,7 @@ test('a status that gives no attempt falls back to deliveryCount, which still bo
   const task = await publishTask(makeTask(name))
   nc.publish(statusSubject(name, task.task_id), 'not a status')
   await until(async () => {
-    const msg = await jsm.direct.getMessage('NATTER_STATE', {
+    const msg = await jsm.direct.getMessage('NATTER_DEFAULT_STATE', {
       last_by_subj: statusSubject(name, task.task_id),
     })
     return msg !== null
@@ -1074,7 +1079,7 @@ test('a retry by the session that won, after a really lost PubAck, is a success'
 /** Makes the broker forget the held task, which frees the one delivery slot. */
 const forgetHeldTask = async (name: string) => {
   const { delivered } = await consumerOf(name)
-  await jsm.streams.deleteMessage('NATTER_TASKS', delivered.stream_seq)
+  await jsm.streams.deleteMessage('NATTER_DEFAULT_TASKS', delivered.stream_seq)
 }
 
 test('the accept timer of a task finished elsewhere never fires on the task that replaced it', async () => {
@@ -1251,7 +1256,7 @@ test('stop() naks at once, even with the consume loop stuck on the broker', asyn
     await pushCount({ pushes }, 1)
     const { gate, reached } = gateFirst(
       conn,
-      '$JS.API.DIRECT.GET.NATTER_RESULTS',
+      '$JS.API.DIRECT.GET.NATTER_DEFAULT_RESULTS',
     )
     await forgetHeldTask(name)
     await publishTask(makeTask(name))
@@ -1277,7 +1282,7 @@ test('a latch set while the consumer is being recreated still stops the pull', a
     worker.start()
     await pushCount({ pushes }, 1)
     const { gate, reached } = gateFirst(conn, '$JS.API.CONSUMER.CREATE.')
-    await jsm.consumers.delete('NATTER_TASKS', `task-${name}`)
+    await jsm.consumers.delete('NATTER_DEFAULT_TASKS', `task-${name}`)
     await until(async () => reached() === 1)
     await statusIs(name, task.task_id, 'released')
 
@@ -1501,7 +1506,7 @@ test('a latch set during the lookup of a lost task leaves the next task unpushed
     await pushCount({ pushes }, 1)
     const { gate, reached } = gateFirst(
       conn,
-      '$JS.API.DIRECT.GET.NATTER_RESULTS',
+      '$JS.API.DIRECT.GET.NATTER_DEFAULT_RESULTS',
     )
     await forgetHeldTask(name)
     await recordResult(name, lost.task_id)

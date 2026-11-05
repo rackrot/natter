@@ -24,7 +24,6 @@ import {
   nanos,
   nuid,
 } from '@nats-io/transport-node'
-import { bootstrapStreams } from '../src/bootstrap'
 import { resolveConfig } from '../src/config'
 import { startConnection } from '../src/connection'
 import {
@@ -36,14 +35,17 @@ import * as protocol from '../src/protocol'
 import {
   encodeEnvelope,
   type Result,
-  resultSubject,
   type Sent,
   type Status,
+  type Task,
+} from '../src/protocol'
+import {
+  bootstrapStreams,
+  resultSubject,
   sentSubject,
   statusSubject,
-  type Task,
   taskSubject,
-} from '../src/protocol'
+} from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
 import { seen } from './support/presence'
 import {
@@ -165,28 +167,28 @@ const getResult = async (s: Pick<Session, 'client'>, task_id: string) =>
 
 const queued = async (worker: string, manager = jsm) => {
   const subject = taskSubject(worker)
-  const info = await manager.streams.info('NATTER_TASKS', {
+  const info = await manager.streams.info('NATTER_DEFAULT_TASKS', {
     subjects_filter: subject,
   })
   return info.state.subjects?.[subject] ?? 0
 }
 
 const statusOf = async (worker: string, taskId: string) => {
-  const msg = await jsm.direct.getMessage('NATTER_STATE', {
+  const msg = await jsm.direct.getMessage('NATTER_DEFAULT_STATE', {
     last_by_subj: statusSubject(worker, taskId),
   })
   return msg ? (msg.json() as Status) : undefined
 }
 
 const storedResult = async (worker: string, taskId: string) => {
-  const msg = await jsm.direct.getMessage('NATTER_RESULTS', {
+  const msg = await jsm.direct.getMessage('NATTER_DEFAULT_RESULTS', {
     last_by_subj: resultSubject(worker, taskId),
   })
   return msg ?? undefined
 }
 
 const recordOf = async (taskId: string, manager = jsm) => {
-  const msg = await manager.direct.getMessage('NATTER_SENT', {
+  const msg = await manager.direct.getMessage('NATTER_DEFAULT_SENT', {
     last_by_subj: sentSubject(taskId),
   })
   return msg ? msg.json<Sent>() : undefined
@@ -194,13 +196,15 @@ const recordOf = async (taskId: string, manager = jsm) => {
 
 /** The newest record's task_id, for a send whose reply gave none. */
 const lastRecordId = async (manager = jsm) => {
-  const { last_seq } = (await manager.streams.info('NATTER_SENT')).state
-  const msg = await manager.direct.getMessage('NATTER_SENT', { seq: last_seq })
+  const { last_seq } = (await manager.streams.info('NATTER_DEFAULT_SENT')).state
+  const msg = await manager.direct.getMessage('NATTER_DEFAULT_SENT', {
+    seq: last_seq,
+  })
   return msg?.json<Sent>().task_id as string
 }
 
 const storedTask = async (worker: string, manager = jsm) => {
-  const msg = await manager.streams.getMessage('NATTER_TASKS', {
+  const msg = await manager.streams.getMessage('NATTER_DEFAULT_TASKS', {
     last_by_subj: taskSubject(worker),
   })
   if (!msg) throw new Error('no task stored')
@@ -304,7 +308,7 @@ const pushCount = async <P>(s: { pushes: P[] }, count: number) => {
 }
 
 const durable = (manager = jsm) =>
-  manager.consumers.info('NATTER_RESULTS', 'results')
+  manager.consumers.info('NATTER_DEFAULT_RESULTS', 'results')
 
 const settled = (count: number, manager = jsm) =>
   until(async () => {
@@ -321,7 +325,7 @@ const settled = (count: number, manager = jsm) =>
 const watchTerminated = async () => {
   const terminated: unknown[] = []
   const sub = nc.subscribe(
-    '$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.NATTER_RESULTS.results',
+    '$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.NATTER_DEFAULT_RESULTS.results',
     {
       callback: (_err, msg) => {
         terminated.push(msg.json())
@@ -469,14 +473,16 @@ beforeEach(async () => {
       () => false,
     ),
   )
-  await jsm.consumers.delete('NATTER_RESULTS', 'results').catch(() => {})
+  await jsm.consumers
+    .delete('NATTER_DEFAULT_RESULTS', 'results')
+    .catch(() => {})
   await Promise.all(
     [
-      'NATTER_TASKS',
-      'NATTER_RESULTS',
-      'NATTER_STATE',
-      'NATTER_PRESENCE',
-      'NATTER_SENT',
+      'NATTER_DEFAULT_TASKS',
+      'NATTER_DEFAULT_RESULTS',
+      'NATTER_DEFAULT_STATE',
+      'NATTER_DEFAULT_PRESENCE',
+      'NATTER_DEFAULT_SENT',
     ].map((stream) => jsm.streams.purge(stream)),
   )
 })
@@ -542,7 +548,7 @@ test('send_task stores the task under its own id, with the defaults filled in', 
   })
   expect(task.parent_task_id).toBeUndefined()
   expect(Date.parse(task.created_at)).toBeGreaterThanOrEqual(before)
-  const record = await jsm.streams.getMessage('NATTER_SENT', {
+  const record = await jsm.streams.getMessage('NATTER_DEFAULT_SENT', {
     last_by_subj: sentSubject(sent.task_id),
   })
   expect(record?.header.get('Nats-Msg-Id')).toBe(sent.task_id)
@@ -569,7 +575,7 @@ test('the record is stored before the task is published, and no row is written',
   const { conn, session, close } = await inProcess()
   try {
     const writes: string[] = []
-    const sub = nc.subscribe('natter.status.>', {
+    const sub = nc.subscribe('natter.default.status.>', {
       callback: (_err, msg) => {
         writes.push(msg.subject)
       },
@@ -614,7 +620,7 @@ test('a record that cannot be stored stops the send', async () => {
   try {
     const real = conn.request.bind(conn)
     conn.request = async (to, ...rest) => {
-      if (to.startsWith('natter.sent.')) throw new errors.TimeoutError()
+      if (to.startsWith('natter.default.sent.')) throw new errors.TimeoutError()
       return real(to, ...rest)
     }
     await seenWorker(worker)
@@ -743,7 +749,7 @@ test('no responders may follow a try that landed, so the reply names the task', 
     const worker = freshName()
     const s = await startConnected({}, server.url)
     await seen(js, worker)
-    await manager.streams.delete('NATTER_TASKS')
+    await manager.streams.delete('NATTER_DEFAULT_TASKS')
 
     const reply = await callTool(s, 'send_task', {
       to: worker,
@@ -774,7 +780,7 @@ test('an invalid send publishes nothing', async () => {
   }
   expect(await queued(worker)).toBe(0)
   expect(await listTasks(s)).toEqual([])
-  expect((await jsm.streams.info('NATTER_SENT')).state.messages).toBe(0)
+  expect((await jsm.streams.info('NATTER_DEFAULT_SENT')).state.messages).toBe(0)
 })
 
 test('a follow-up takes its root and depth from the parent record', async () => {
@@ -797,7 +803,7 @@ test('a follow-up takes its root and depth from the parent record', async () => 
     root_task_id: first.task_id,
     depth: 2,
   })
-  const stored = await jsm.streams.getMessage('NATTER_TASKS', {
+  const stored = await jsm.streams.getMessage('NATTER_DEFAULT_TASKS', {
     last_by_subj: taskSubject(worker),
   })
   expect(stored?.json<Task>()).toMatchObject({
@@ -823,7 +829,7 @@ test('a parent with no record is refused, whatever its rows say, and nothing is 
     expect(reply.isError).toBe(true)
   }
   expect(await queued(worker)).toBe(0)
-  expect((await jsm.streams.info('NATTER_SENT')).state.messages).toBe(0)
+  expect((await jsm.streams.info('NATTER_DEFAULT_SENT')).state.messages).toBe(0)
 })
 
 // ------------------------------------------------------------ results durable
@@ -838,7 +844,7 @@ test('the durable is explicit-ack, filtered to results, eight at a time, with no
   )
   const { config } = await durable()
   expect(config).toMatchObject({
-    filter_subject: 'natter.result.*.*',
+    filter_subject: 'natter.default.result.*.*',
     ack_policy: 'explicit',
     max_ack_pending: 8,
     ack_wait: nanos(ACK_WAIT_MS),
@@ -847,10 +853,10 @@ test('the durable is explicit-ack, filtered to results, eight at a time, with no
 })
 
 test('a drifted durable is brought back to the wanted settings', async () => {
-  await jsm.consumers.add('NATTER_RESULTS', {
+  await jsm.consumers.add('NATTER_DEFAULT_RESULTS', {
     durable_name: 'results',
     ack_policy: AckPolicy.Explicit,
-    filter_subject: 'natter.result.*.*',
+    filter_subject: 'natter.default.result.*.*',
     max_ack_pending: 2,
   })
   await startOrchestrator()
@@ -1032,7 +1038,7 @@ test('a result whose push failed goes to the next session', async () => {
   await until(async () => attempts === 1)
   await close()
   // The in-flight ack_wait of the session that is gone.
-  await jsm.consumers.update('NATTER_RESULTS', 'results', {
+  await jsm.consumers.update('NATTER_DEFAULT_RESULTS', 'results', {
     ack_wait: nanos(ACK_WAIT_MS),
   })
 
@@ -1051,7 +1057,10 @@ test('a lost ack does not push the same result twice in one session', async () =
     const real = wire.publish.bind(wire)
     let dropped = 0
     wire.publish = (subject, ...rest) => {
-      if (subject.startsWith('$JS.ACK.NATTER_RESULTS.') && dropped === 0) {
+      if (
+        subject.startsWith('$JS.ACK.NATTER_DEFAULT_RESULTS.') &&
+        dropped === 0
+      ) {
         dropped++
         return
       }
@@ -1122,7 +1131,7 @@ test('the durable is recreated if it is deleted under a running session', async 
       () => false,
     ),
   )
-  await jsm.consumers.delete('NATTER_RESULTS', 'results')
+  await jsm.consumers.delete('NATTER_DEFAULT_RESULTS', 'results')
   const worker = freshName()
   const { task_id } = await send(s, worker)
   await storeResult(worker, task_id)
@@ -1495,14 +1504,17 @@ test('a finished row with no result stays open', async () => {
   expect(current.state).toBe('queued')
   expect(current.outcome).toBeUndefined()
 
-  await jsm.streams.purge('NATTER_TASKS')
+  await jsm.streams.purge('NATTER_DEFAULT_TASKS')
   expect(rowFor(await listTasks(s, true), task_id)?.state).toBe('lost')
 })
 
 test('a task stays visible when its row is evicted', async () => {
   await onFreshServer(async (server, js, manager) => {
-    const { config } = await manager.streams.info('NATTER_STATE')
-    await manager.streams.update('NATTER_STATE', { ...config, max_msgs: 5 })
+    const { config } = await manager.streams.info('NATTER_DEFAULT_STATE')
+    await manager.streams.update('NATTER_DEFAULT_STATE', {
+      ...config,
+      max_msgs: 5,
+    })
     const worker = freshName()
     const s = await startConnected({}, server.url)
     const { task_id } = await send(s, worker)
@@ -1514,7 +1526,7 @@ test('a task stays visible when its row is evicted', async () => {
         writeRow(freshName(), nuid.next(), {}, js),
       ),
     )
-    const row = await manager.direct.getMessage('NATTER_STATE', {
+    const row = await manager.direct.getMessage('NATTER_DEFAULT_STATE', {
       last_by_subj: statusSubject(worker, task_id),
     })
     expect(row).toBeNull()
@@ -1591,7 +1603,8 @@ test('list_tasks returns in bounded time, with the task, while workers write in 
     await underFlood(server, flood, async () => {
       await until(
         async () =>
-          (await manager.streams.info('NATTER_STATE')).state.messages > 2000,
+          (await manager.streams.info('NATTER_DEFAULT_STATE')).state.messages >
+          2000,
       )
       const started = Date.now()
       const rows = await listTasks(s, true)
@@ -1610,7 +1623,8 @@ test('list_tasks stops at the last record it saw, however fast records arrive', 
     await underFlood(server, flood, async () => {
       await until(
         async () =>
-          (await manager.streams.info('NATTER_SENT')).state.messages > 2000,
+          (await manager.streams.info('NATTER_DEFAULT_SENT')).state.messages >
+          2000,
       )
       const started = Date.now()
       await listTasks(s, true)
@@ -1644,8 +1658,8 @@ test('list_tasks shows open and finished tasks after a restart', async () => {
 
 test('a task the broker deleted at max_age shows as lost, not as queued', async () => {
   await onFreshServer(async (server, _js, manager) => {
-    const { config } = await manager.streams.info('NATTER_TASKS')
-    await manager.streams.update('NATTER_TASKS', {
+    const { config } = await manager.streams.info('NATTER_DEFAULT_TASKS')
+    await manager.streams.update('NATTER_DEFAULT_TASKS', {
       ...config,
       max_age: nanos(1000),
       duplicate_window: nanos(1000),
@@ -1670,10 +1684,10 @@ test('any open task gone from its queue is lost, and only then', async () => {
     const { task_id } = await send(s, worker)
     await writeRow(worker, task_id, { state })
     expect(rowFor(await listTasks(s), task_id)?.state).toBe(state)
-    const stored = await jsm.streams.getMessage('NATTER_TASKS', {
+    const stored = await jsm.streams.getMessage('NATTER_DEFAULT_TASKS', {
       last_by_subj: taskSubject(worker),
     })
-    await jsm.streams.deleteMessage('NATTER_TASKS', stored?.seq ?? 0)
+    await jsm.streams.deleteMessage('NATTER_DEFAULT_TASKS', stored?.seq ?? 0)
     expect(rowFor(await listTasks(s), task_id)?.state).toBe('lost')
   }
 })
@@ -1681,7 +1695,7 @@ test('any open task gone from its queue is lost, and only then', async () => {
 test('a record under another id is no record', async () => {
   const s = await startConnected()
   const [real] = await writeRecords(freshName(), 1)
-  const stored = await jsm.direct.getMessage('NATTER_SENT', {
+  const stored = await jsm.direct.getMessage('NATTER_DEFAULT_SENT', {
     last_by_subj: sentSubject(real as string),
   })
   const elsewhere = nuid.next()
@@ -1699,7 +1713,7 @@ test('a result that cannot be read leaves the task lost, and says so', async () 
   const s = await startConnected()
   const { task_id } = await send(s, worker)
   await jetstream(nc).publish(resultSubject(worker, task_id), 'not json')
-  await jsm.streams.purge('NATTER_TASKS')
+  await jsm.streams.purge('NATTER_DEFAULT_TASKS')
 
   expect(rowFor(await listTasks(s), task_id)).toMatchObject({
     state: 'lost',
@@ -1720,7 +1734,7 @@ test('a result older than its record says so, and not that it is unreadable', as
   const { session, close } = await inProcess()
   try {
     await send(session, worker)
-    await jsm.streams.purge('NATTER_TASKS')
+    await jsm.streams.purge('NATTER_DEFAULT_TASKS')
     const { state, note } = await getResult(session, task_id)
     expect(state).toBe('lost')
     expect(note).toBe('result older than its record')
@@ -1736,7 +1750,7 @@ test('a task finishing during the read is not reported lost', async () => {
   try {
     const { task_id } = await send(session, worker)
     await writeRow(worker, task_id, { state: 'accepted' })
-    const { seq } = (await jsm.streams.getMessage('NATTER_TASKS', {
+    const { seq } = (await jsm.streams.getMessage('NATTER_DEFAULT_TASKS', {
       last_by_subj: taskSubject(worker),
     })) ?? { seq: 0 }
 
@@ -1744,10 +1758,10 @@ test('a task finishing during the read is not reported lost', async () => {
     const real = conn.request.bind(conn)
     let landed = false
     conn.request = async (subject, ...rest) => {
-      if (subject.includes('STREAM.MSG.GET.NATTER_TASKS') && !landed) {
+      if (subject.includes('STREAM.MSG.GET.NATTER_DEFAULT_TASKS') && !landed) {
         landed = true
         await storeResult(worker, task_id)
-        await jsm.streams.deleteMessage('NATTER_TASKS', seq)
+        await jsm.streams.deleteMessage('NATTER_DEFAULT_TASKS', seq)
       }
       return real(subject, ...rest)
     }
@@ -1785,11 +1799,11 @@ test('list_tasks goes by the stream, past the 1024 a single direct get can retur
 test('gaps in the stream neither shorten the list nor repeat a task', async () => {
   const s = await startConnected()
   const ids = await writeRecords(freshName(), 450)
-  const { state } = await jsm.streams.info('NATTER_SENT')
+  const { state } = await jsm.streams.info('NATTER_DEFAULT_SENT')
   // One in each window, and the whole of the newest.
-  await jsm.streams.deleteMessage('NATTER_SENT', state.last_seq - 300)
+  await jsm.streams.deleteMessage('NATTER_DEFAULT_SENT', state.last_seq - 300)
   for (let seq = state.last_seq; seq > state.last_seq - 200; seq--) {
-    await jsm.streams.deleteMessage('NATTER_SENT', seq)
+    await jsm.streams.deleteMessage('NATTER_DEFAULT_SENT', seq)
   }
   const { tasks } = await listing(s)
   const left = ids.slice(0, 250).filter((_, i) => i !== 149)
@@ -1799,11 +1813,11 @@ test('gaps in the stream neither shorten the list nor repeat a task', async () =
 test('a gap in an older window does not repeat a task from the newer one', async () => {
   const s = await startConnected()
   const ids = await writeRecords(freshName(), 450)
-  const { state } = await jsm.streams.info('NATTER_SENT')
+  const { state } = await jsm.streams.info('NATTER_DEFAULT_SENT')
   const seqOf = (index: number) => state.last_seq - (ids.length - 1 - index)
   // The first leaves the newest window short, the second lets the next run on.
-  await jsm.streams.deleteMessage('NATTER_SENT', seqOf(300))
-  await jsm.streams.deleteMessage('NATTER_SENT', seqOf(100))
+  await jsm.streams.deleteMessage('NATTER_DEFAULT_SENT', seqOf(300))
+  await jsm.streams.deleteMessage('NATTER_DEFAULT_SENT', seqOf(100))
   const left = ids.filter((_, i) => i !== 300 && i !== 100)
   const { tasks } = await listing(s)
   expect(tasks.map((row) => row.task_id)).toEqual(left.slice(-200).reverse())
@@ -1852,7 +1866,7 @@ test('a scan of many windows reads the queue once', async () => {
     const real = conn.request.bind(conn)
     let walks = 0
     conn.request = async (subject, ...rest) => {
-      if (subject.includes('STREAM.MSG.GET.NATTER_TASKS')) walks++
+      if (subject.includes('STREAM.MSG.GET.NATTER_DEFAULT_TASKS')) walks++
       return real(subject, ...rest)
     }
 
@@ -1893,8 +1907,11 @@ const setAllowDirect = async (
   manager: JetStreamManager,
   allow_direct: boolean,
 ) => {
-  const { config } = await manager.streams.info('NATTER_SENT')
-  await manager.streams.update('NATTER_SENT', { ...config, allow_direct })
+  const { config } = await manager.streams.info('NATTER_DEFAULT_SENT')
+  await manager.streams.update('NATTER_DEFAULT_SENT', {
+    ...config,
+    allow_direct,
+  })
 }
 
 test('a record read that fails leaves the result unacked until it works', async () => {
@@ -1919,12 +1936,12 @@ test('a record read that fails leaves the result unacked until it works', async 
   })
 })
 
-test('a missing NATTER_SENT holds results, stops sends, and recovers after bootstrap', async () => {
+test('a missing NATTER_DEFAULT_SENT holds results, stops sends, and recovers after bootstrap', async () => {
   await onFreshServer(async (server, js, manager) => {
     const worker = freshName()
     const s = await startConnected({}, server.url)
     const { task_id } = await send(s, worker)
-    await manager.streams.delete('NATTER_SENT')
+    await manager.streams.delete('NATTER_DEFAULT_SENT')
     await storeResult(worker, task_id, {}, js)
     await until(async () =>
       durable(manager).then(

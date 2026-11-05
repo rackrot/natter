@@ -17,24 +17,23 @@ import {
   nanos,
   nuid,
 } from '@nats-io/transport-node'
+import { streamsFor } from '../src/bootstrap'
+import { MAX_TIMEOUT_S } from '../src/config'
+import { MAX_MESSAGE_BYTES } from '../src/protocol'
 import {
   bootstrapStreams,
   PRESENCE_STREAM,
+  presenceSubject,
   RESULTS_STREAM,
+  resultSubject,
   SENT_STREAM,
   STATE_STREAM,
   STREAMS,
-  TASKS_STREAM,
-} from '../src/bootstrap'
-import { MAX_TIMEOUT_S } from '../src/config'
-import {
-  MAX_MESSAGE_BYTES,
-  presenceSubject,
-  resultSubject,
   sentSubject,
   statusSubject,
+  TASKS_STREAM,
   taskSubject,
-} from '../src/protocol'
+} from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
 
 // A Bun test timeout kills tracked subprocesses, including a shared nats-server.
@@ -126,7 +125,7 @@ const recordResult = async () => {
 }
 
 const storedResult = async (subject: string) => {
-  const msg = await jsm.streams.getMessage('NATTER_RESULTS', {
+  const msg = await jsm.streams.getMessage('NATTER_DEFAULT_RESULTS', {
     last_by_subj: subject,
   })
   return { seq: msg?.seq, value: msg?.string() }
@@ -145,11 +144,11 @@ afterAll(async () => {
 test('creates the five streams with the plan settings', async () => {
   const outcomes = await bootstrapStreams(jsm)
   expect(outcomes.map((o) => [o.name, o.action])).toEqual([
-    ['NATTER_TASKS', 'created'],
-    ['NATTER_RESULTS', 'created'],
-    ['NATTER_STATE', 'created'],
-    ['NATTER_PRESENCE', 'created'],
-    ['NATTER_SENT', 'created'],
+    ['NATTER_DEFAULT_TASKS', 'created'],
+    ['NATTER_DEFAULT_RESULTS', 'created'],
+    ['NATTER_DEFAULT_STATE', 'created'],
+    ['NATTER_DEFAULT_PRESENCE', 'created'],
+    ['NATTER_DEFAULT_SENT', 'created'],
   ])
 
   const day = 24 * 60 * 60 * 1000
@@ -160,8 +159,8 @@ test('creates the five streams with the plan settings', async () => {
   }
   expect(await managed(TASKS_STREAM)).toEqual({
     ...base,
-    name: 'NATTER_TASKS',
-    subjects: ['natter.task.*'],
+    name: 'NATTER_DEFAULT_TASKS',
+    subjects: ['natter.default.task.*'],
     retention: 'workqueue',
     max_age: nanos(7 * day),
     max_msgs_per_subject: 16,
@@ -172,8 +171,8 @@ test('creates the five streams with the plan settings', async () => {
   })
   expect(await managed(RESULTS_STREAM)).toEqual({
     ...base,
-    name: 'NATTER_RESULTS',
-    subjects: ['natter.result.*.*'],
+    name: 'NATTER_DEFAULT_RESULTS',
+    subjects: ['natter.default.result.*.*'],
     retention: 'limits',
     max_age: nanos(14 * day),
     max_msgs_per_subject: 1,
@@ -184,8 +183,8 @@ test('creates the five streams with the plan settings', async () => {
   })
   expect(await managed(STATE_STREAM)).toEqual({
     ...base,
-    name: 'NATTER_STATE',
-    subjects: ['natter.status.*.*'],
+    name: 'NATTER_DEFAULT_STATE',
+    subjects: ['natter.default.status.*.*'],
     retention: 'limits',
     max_age: nanos(14 * day),
     max_msgs_per_subject: 1,
@@ -196,8 +195,8 @@ test('creates the five streams with the plan settings', async () => {
   })
   expect(await managed(PRESENCE_STREAM)).toEqual({
     ...base,
-    name: 'NATTER_PRESENCE',
-    subjects: ['natter.presence.*'],
+    name: 'NATTER_DEFAULT_PRESENCE',
+    subjects: ['natter.default.presence.*'],
     retention: 'limits',
     max_age: nanos(14 * day),
     max_msgs_per_subject: 1,
@@ -209,8 +208,8 @@ test('creates the five streams with the plan settings', async () => {
   })
   expect(await managed(SENT_STREAM)).toEqual({
     ...base,
-    name: 'NATTER_SENT',
-    subjects: ['natter.sent.*'],
+    name: 'NATTER_DEFAULT_SENT',
+    subjects: ['natter.default.sent.*'],
     retention: 'limits',
     max_age: nanos(30 * day),
     max_msgs_per_subject: 1,
@@ -231,7 +230,7 @@ test('a record cannot be replaced, and a retry of it does not duplicate', async 
     (await js.publish(subject, 'first', { msgID: taskId })).duplicate,
   ).toBe(true)
   expect(await apiCode(js.publish(subject, 'second'))).toBe(STREAM_STORE_FAILED)
-  const stored = await jsm.direct.getMessage('NATTER_SENT', {
+  const stored = await jsm.direct.getMessage('NATTER_DEFAULT_SENT', {
     last_by_subj: subject,
   })
   expect(stored?.seq).toBe(first.seq)
@@ -261,41 +260,45 @@ test('a heartbeat over 4 KiB is rejected, one at the limit is stored', async () 
   )
 })
 
-test('a server with presence on NATTER_STATE moves it to its own stream', async () => {
+test('a server with presence on NATTER_DEFAULT_STATE moves it to its own stream', async () => {
   await onFreshServer(async (_server, conn, manager) => {
     await manager.streams.add({
       ...STATE_STREAM,
-      subjects: [...STATE_STREAM.subjects, 'natter.presence.*'],
+      subjects: [...STATE_STREAM.subjects, 'natter.default.presence.*'],
     })
 
     const outcomes = await bootstrapStreams(manager)
 
-    expect(outcomes.find((o) => o.name === 'NATTER_STATE')).toMatchObject({
+    expect(
+      outcomes.find((o) => o.name === 'NATTER_DEFAULT_STATE'),
+    ).toMatchObject({
       action: 'updated',
       changed: ['subjects'],
     })
-    expect(outcomes.find((o) => o.name === 'NATTER_PRESENCE')?.action).toBe(
-      'created',
-    )
+    expect(
+      outcomes.find((o) => o.name === 'NATTER_DEFAULT_PRESENCE')?.action,
+    ).toBe('created')
     const { seq } = await jetstream(conn).publish(
       presenceSubject('alpha'),
       'here',
     )
-    const stored = await manager.direct.getMessage('NATTER_PRESENCE', {
+    const stored = await manager.direct.getMessage('NATTER_DEFAULT_PRESENCE', {
       last_by_subj: presenceSubject('alpha'),
     })
     expect(stored?.seq).toBe(seq)
   })
 })
 
-test('a run keeps the records of a NATTER_SENT that has drifted', async () => {
+test('a run keeps the records of a NATTER_DEFAULT_SENT that has drifted', async () => {
   await onFreshServer(async (_server, conn, manager) => {
     await manager.streams.add({ ...SENT_STREAM, max_bytes: 512 * MIB })
     await jetstream(conn).publish(sentSubject(nuid.next()), 'kept')
 
     const outcomes = await bootstrapStreams(manager)
 
-    expect(outcomes.find((o) => o.name === 'NATTER_SENT')).toMatchObject({
+    expect(
+      outcomes.find((o) => o.name === 'NATTER_DEFAULT_SENT'),
+    ).toMatchObject({
       action: 'updated',
       changed: ['max_bytes'],
       messages: { before: 1, after: 1 },
@@ -334,12 +337,12 @@ test('a second run changes nothing and keeps stored messages', async () => {
   expect(await Promise.all(STREAMS.map((s) => configOf(s.name)))).toEqual(
     before,
   )
-  expect(await messagesIn('NATTER_TASKS')).toBe(1)
+  expect(await messagesIn('NATTER_DEFAULT_TASKS')).toBe(1)
 })
 
 test('a drifted stream is updated back without losing messages', async () => {
-  const drifted = await configOf('NATTER_TASKS')
-  await jsm.streams.update('NATTER_TASKS', {
+  const drifted = await configOf('NATTER_DEFAULT_TASKS')
+  await jsm.streams.update('NATTER_DEFAULT_TASKS', {
     ...drifted,
     subjects: [...drifted.subjects, 'natter.drift.*'],
     max_age: nanos(60_000),
@@ -348,19 +351,19 @@ test('a drifted stream is updated back without losing messages', async () => {
     max_bytes: 512 * MIB,
     duplicate_window: nanos(30_000),
   })
-  const resultsDrift = await configOf('NATTER_RESULTS')
-  await jsm.streams.update('NATTER_RESULTS', {
+  const resultsDrift = await configOf('NATTER_DEFAULT_RESULTS')
+  await jsm.streams.update('NATTER_DEFAULT_RESULTS', {
     ...resultsDrift,
     discard_new_per_subject: false,
   })
-  const stateDrift = await configOf('NATTER_STATE')
-  await jsm.streams.update('NATTER_STATE', {
+  const stateDrift = await configOf('NATTER_DEFAULT_STATE')
+  await jsm.streams.update('NATTER_DEFAULT_STATE', {
     ...stateDrift,
     allow_direct: false,
     discard: DiscardPolicy.New,
     discard_new_per_subject: true,
   })
-  const held = await messagesIn('NATTER_TASKS')
+  const held = await messagesIn('NATTER_DEFAULT_TASKS')
 
   const outcomes = await bootstrapStreams(jsm)
 
@@ -374,7 +377,7 @@ test('a drifted stream is updated back without losing messages', async () => {
     ]),
   ).toEqual([
     [
-      'NATTER_TASKS',
+      'NATTER_DEFAULT_TASKS',
       'updated',
       [
         'duplicate_window',
@@ -387,21 +390,21 @@ test('a drifted stream is updated back without losing messages', async () => {
       held,
       held,
     ],
-    ['NATTER_RESULTS', 'updated', ['discard_new_per_subject'], 0, 0],
+    ['NATTER_DEFAULT_RESULTS', 'updated', ['discard_new_per_subject'], 0, 0],
     [
-      'NATTER_STATE',
+      'NATTER_DEFAULT_STATE',
       'updated',
       ['allow_direct', 'discard', 'discard_new_per_subject'],
       0,
       0,
     ],
-    ['NATTER_PRESENCE', 'unchanged', [], undefined, undefined],
-    ['NATTER_SENT', 'unchanged', [], undefined, undefined],
+    ['NATTER_DEFAULT_PRESENCE', 'unchanged', [], undefined, undefined],
+    ['NATTER_DEFAULT_SENT', 'unchanged', [], undefined, undefined],
   ])
   for (const stream of STREAMS) {
     expect(await managed(stream)).toEqual({ ...stream })
   }
-  expect(await messagesIn('NATTER_TASKS')).toBe(held)
+  expect(await messagesIn('NATTER_DEFAULT_TASKS')).toBe(held)
 })
 
 test('a tightened limit shows what it trimmed', async () => {
@@ -413,10 +416,12 @@ test('a tightened limit shows what it trimmed', async () => {
     const { code, stdout } = await runBootstrap(server.url)
 
     expect(code).toBe(0)
-    const state = await manager.streams.info('NATTER_STATE')
+    const state = await manager.streams.info('NATTER_DEFAULT_STATE')
     expect(state.config.max_msgs_per_subject).toBe(1)
     expect(state.state.messages).toBe(1)
-    const line = stdout.split('\n').find((l) => l.includes('NATTER_STATE'))
+    const line = stdout
+      .split('\n')
+      .find((l) => l.includes('NATTER_DEFAULT_STATE'))
     expect(line).toMatch(/\b5\b.*\b1\b/)
   })
 })
@@ -433,15 +438,15 @@ test.each([
     await jetstream(conn).publish(statusSubject('alpha', nuid.next()), 'here')
 
     await expect(bootstrapStreams(manager)).rejects.toThrow(
-      `NATTER_STATE.${key}`,
+      `NATTER_DEFAULT_STATE.${key}`,
     )
 
-    const state = await manager.streams.info('NATTER_STATE')
+    const state = await manager.streams.info('NATTER_DEFAULT_STATE')
     expect(state.config).toMatchObject(drift)
     expect(state.state.messages).toBe(1)
-    const results = await manager.streams.info('NATTER_RESULTS')
+    const results = await manager.streams.info('NATTER_DEFAULT_RESULTS')
     expect(results.config.max_msgs_per_subject).toBe(5)
-    expect(await apiCode(manager.streams.info('NATTER_TASKS'))).toBe(
+    expect(await apiCode(manager.streams.info('NATTER_DEFAULT_TASKS'))).toBe(
       JetStreamApiCodes.StreamNotFound,
     )
   })
@@ -477,7 +482,7 @@ test('tls:// against a plain server does not connect', async () => {
 
     expect(code).toBe(1)
     expect(await server.totalConnections()).toBeGreaterThan(dialsBefore)
-    expect(await apiCode(manager.streams.info('NATTER_TASKS'))).toBe(
+    expect(await apiCode(manager.streams.info('NATTER_DEFAULT_TASKS'))).toBe(
       JetStreamApiCodes.StreamNotFound,
     )
   })
@@ -489,7 +494,7 @@ test('the per-subject cap rejects the 17th queued task but not another worker', 
   for (let i = 0; i < 16; i++) await js.publish(subject, `t${i}`)
   await expect(js.publish(subject, 't16')).rejects.toThrow()
   expect((await js.publish(taskSubject('other'), 'ok')).stream).toBe(
-    'NATTER_TASKS',
+    'NATTER_DEFAULT_TASKS',
   )
 })
 
@@ -548,4 +553,58 @@ test('a core publish cannot replace a recorded result', async () => {
   await until(async () => (await storedResult(control)).value === 'captured')
 
   expect(await storedResult(subject)).toEqual({ seq, value: 'first' })
+})
+
+test('NATTER_FLEET=x creates five NATTER_X_* streams like the default fleet and leaves others alone', async () => {
+  await onFreshServer(async (server, _conn, manager) => {
+    const run = async (fleet: string) => {
+      const proc = Bun.spawn(['bun', 'src/bootstrap.ts'], {
+        env: {
+          PATH: process.env.PATH ?? '',
+          NATTER_URL: server.url,
+          NATTER_CREDS_DIR: join(tmpdir(), 'natter-no-creds'),
+          NATTER_FLEET: fleet,
+        },
+        stdout: 'ignore',
+        stderr: 'ignore',
+        timeout: 4000,
+      })
+      return proc.exited
+    }
+    const names = async () =>
+      (await manager.streams.list().next()).map((s) => s.config.name).sort()
+    const owned = (config: Record<string, unknown>) => {
+      const { name, subjects, ...settings } = config
+      return settings
+    }
+
+    expect(await run('default')).toBe(0)
+    const defaults = await names()
+    expect(defaults).toHaveLength(5)
+    expect(await run('x')).toBe(0)
+
+    expect(await names()).toEqual(
+      [
+        ...defaults,
+        ...['TASKS', 'RESULTS', 'STATE', 'PRESENCE', 'SENT'].map(
+          (s) => `NATTER_X_${s}`,
+        ),
+      ].sort(),
+    )
+    for (const suffix of ['TASKS', 'RESULTS', 'STATE', 'PRESENCE', 'SENT']) {
+      const x = (await manager.streams.info(`NATTER_X_${suffix}`)).config
+      const d = (await manager.streams.info(`NATTER_DEFAULT_${suffix}`)).config
+      expect(x.subjects).toEqual(
+        d.subjects.map((subject) => subject.replace('default', 'x')),
+      )
+      const keys = Object.keys(
+        owned(streamsFor('x').find((w) => w.name === x.name) ?? {}),
+      )
+      for (const key of keys) {
+        expect(x[key as keyof typeof x]).toEqual(d[key as keyof typeof d])
+      }
+    }
+    expect(await run('Bad_Fleet')).not.toBe(0)
+    expect(await names()).toHaveLength(10)
+  })
 })

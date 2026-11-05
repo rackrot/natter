@@ -1,21 +1,21 @@
 import type { MsgHdrs } from '@nats-io/transport-node'
 import { z } from 'zod'
-import { MAX_DESCRIPTION_BYTES, MAX_TIMEOUT_S, NAME_PATTERN } from './config'
+import {
+  FLEET_PATTERN,
+  MAX_DESCRIPTION_BYTES,
+  MAX_TIMEOUT_S,
+  NAME_PATTERN,
+} from './config'
 
 // Pure wire protocol: subjects, envelopes, and what may reach Claude.
 // Everything arriving from NATS is untrusted; see plan section 3.2 and 3.6.
 
 export const PROTOCOL_VERSION = 1
 export const MAX_MESSAGE_BYTES = 128 * 1024
-export const TASKS_STREAM_NAME = 'NATTER_TASKS'
-export const RESULTS_STREAM_NAME = 'NATTER_RESULTS'
-export const STATE_STREAM_NAME = 'NATTER_STATE'
-export const SENT_STREAM_NAME = 'NATTER_SENT'
-export const PRESENCE_STREAM_NAME = 'NATTER_PRESENCE'
 export const PRESENCE_MAX_BYTES = 64 * 1024 * 1024
-/** The orchestrator's durable on NATTER_RESULTS. */
+/** The orchestrator's durable on its fleet's results stream. */
 export const RESULTS_DURABLE = 'results'
-/** A worker's durable on NATTER_TASKS. */
+/** A worker's durable on its fleet's tasks stream. */
 export const workerDurable = (name: string) => `task-${name}`
 const MAX_JSON_DEPTH = 32
 const MAX_ARTIFACTS = 32
@@ -74,33 +74,65 @@ const nuidToken = (value: string, what: string): string => {
   return value
 }
 
-export const taskSubject = (worker: string) =>
-  `natter.task.${nameToken(worker, 'worker')}`
-/** Wildcard forms of the five subjects, for stream capture and ACLs. */
-export const TASK_SUBJECTS = 'natter.task.*'
-export const RESULT_SUBJECTS = 'natter.result.*.*'
-export const STATUS_SUBJECTS = 'natter.status.*.*'
-export const PRESENCE_SUBJECTS = 'natter.presence.*'
-export const SENT_SUBJECTS = 'natter.sent.*'
+const fleetToken = (value: string): string => {
+  if (!FLEET_PATTERN.test(value)) throw new WireError('invalid fleet')
+  return value
+}
 
-export const presenceSubject = (worker: string) =>
-  `natter.presence.${nameToken(worker, 'worker')}`
-export const resultSubject = (worker: string, taskId: string) =>
-  `natter.result.${nameToken(worker, 'worker')}.${nuidToken(taskId, 'task_id')}`
-export const statusSubject = (worker: string, taskId: string) =>
-  `natter.status.${nameToken(worker, 'worker')}.${nuidToken(taskId, 'task_id')}`
-export const sentSubject = (taskId: string) =>
-  `natter.sent.${nuidToken(taskId, 'task_id')}`
+/**
+ * Every stream name and subject of one fleet, built once per session. A fleet
+ * is five streams and a subject prefix (plan 3.1), so a session that only
+ * names its own scope cannot reach another fleet's records.
+ */
+export function fleetScope(fleet: string) {
+  const prefix = `natter.${fleetToken(fleet)}`
+  const stream = (suffix: string) => `NATTER_${fleet.toUpperCase()}_${suffix}`
+  const streams = {
+    tasks: stream('TASKS'),
+    results: stream('RESULTS'),
+    state: stream('STATE'),
+    sent: stream('SENT'),
+    presence: stream('PRESENCE'),
+  }
+  return {
+    fleet,
+    streams,
+    /** Wildcard forms of the five subjects, for stream capture and ACLs. */
+    subjects: {
+      task: `${prefix}.task.*`,
+      result: `${prefix}.result.*.*`,
+      status: `${prefix}.status.*.*`,
+      presence: `${prefix}.presence.*`,
+      sent: `${prefix}.sent.*`,
+    },
+    taskSubject: (worker: string) =>
+      `${prefix}.task.${nameToken(worker, 'worker')}`,
+    presenceSubject: (worker: string) =>
+      `${prefix}.presence.${nameToken(worker, 'worker')}`,
+    resultSubject: (worker: string, taskId: string) =>
+      `${prefix}.result.${nameToken(worker, 'worker')}.${nuidToken(taskId, 'task_id')}`,
+    statusSubject: (worker: string, taskId: string) =>
+      `${prefix}.status.${nameToken(worker, 'worker')}.${nuidToken(taskId, 'task_id')}`,
+    sentSubject: (taskId: string) =>
+      `${prefix}.sent.${nuidToken(taskId, 'task_id')}`,
+  }
+}
+export type FleetScope = ReturnType<typeof fleetScope>
 
 export type SubjectInfo =
   | { kind: 'task' | 'presence'; worker: string }
   | { kind: 'result' | 'status'; worker: string; taskId: string }
   | { kind: 'sent'; taskId: string }
 
-/** Returns undefined for any subject that is not exactly one of the five. */
+/**
+ * Returns undefined for any subject that is not exactly one of the five, in
+ * a fleet whose name is valid. The fleet itself is not returned: the stream a
+ * message came from already fixes it.
+ */
 export function parseSubject(subject: string): SubjectInfo | undefined {
-  const [root, kind, worker, taskId, ...rest] = subject.split('.')
+  const [root, fleet, kind, worker, taskId, ...rest] = subject.split('.')
   if (root !== 'natter' || rest.length > 0) return undefined
+  if (fleet === undefined || !FLEET_PATTERN.test(fleet)) return undefined
   if (kind === 'sent') {
     // The second token is the id here: a record belongs to no worker's subject.
     return worker !== undefined &&

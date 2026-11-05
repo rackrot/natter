@@ -15,18 +15,20 @@ import {
   jetstreamManager,
 } from '@nats-io/jetstream'
 import { connect, type NatsConnection, nuid } from '@nats-io/transport-node'
-import { bootstrapStreams } from '../src/bootstrap'
 import {
   encodeEnvelope,
   type Result,
-  resultSubject,
   type Sent,
   type Status,
+  type Task,
+} from '../src/protocol'
+import {
+  bootstrapStreams,
+  resultSubject,
   sentSubject,
   statusSubject,
-  type Task,
   taskSubject,
-} from '../src/protocol'
+} from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
 import { seen } from './support/presence'
 import { callTool, type Session, startSession } from './support/session'
@@ -89,7 +91,7 @@ const stored = async (stream: string) =>
 
 const queued = async (worker: string) => {
   const subject = taskSubject(worker)
-  const info = await jsm.streams.info('NATTER_TASKS', {
+  const info = await jsm.streams.info('NATTER_DEFAULT_TASKS', {
     subjects_filter: subject,
   })
   return info.state.subjects?.[subject] ?? 0
@@ -158,14 +160,16 @@ beforeEach(async () => {
       () => false,
     ),
   )
-  await jsm.consumers.delete('NATTER_RESULTS', 'results').catch(() => {})
+  await jsm.consumers
+    .delete('NATTER_DEFAULT_RESULTS', 'results')
+    .catch(() => {})
   await Promise.all(
     [
-      'NATTER_TASKS',
-      'NATTER_RESULTS',
-      'NATTER_STATE',
-      'NATTER_PRESENCE',
-      'NATTER_SENT',
+      'NATTER_DEFAULT_TASKS',
+      'NATTER_DEFAULT_RESULTS',
+      'NATTER_DEFAULT_STATE',
+      'NATTER_DEFAULT_PRESENCE',
+      'NATTER_DEFAULT_SENT',
     ].map((stream) => jsm.streams.purge(stream)),
   )
 })
@@ -191,12 +195,12 @@ test('a send over the per-worker rate is refused and publishes nothing, then the
 
   expect((await send(s, worker)).isError).toBeFalsy()
   expect((await send(s, worker)).isError).toBeFalsy()
-  const records = await stored('NATTER_SENT')
+  const records = await stored('NATTER_DEFAULT_SENT')
   const tasks = await queued(worker)
 
   const refused = await send(s, worker)
   expect(refused.isError).toBe(true)
-  expect(await stored('NATTER_SENT')).toBe(records)
+  expect(await stored('NATTER_DEFAULT_SENT')).toBe(records)
   expect(await queued(worker)).toBe(tasks)
 
   // The limit is per worker.
@@ -212,10 +216,10 @@ test('a send over the global rate is refused and publishes nothing', async () =>
 
   expect((await send(s, a)).isError).toBeFalsy()
   expect((await send(s, b)).isError).toBeFalsy()
-  const records = await stored('NATTER_SENT')
+  const records = await stored('NATTER_DEFAULT_SENT')
 
   expect((await send(s, c)).isError).toBe(true)
-  expect(await stored('NATTER_SENT')).toBe(records)
+  expect(await stored('NATTER_DEFAULT_SENT')).toBe(records)
   expect(await queued(c)).toBe(0)
 })
 
@@ -256,7 +260,7 @@ test('a send whose record publish fails without a broker answer keeps its tokens
   await seen(jetstream(nc), worker)
   const s = await startOrchestrator({ NATTER_TEST_SEND_PER_WORKER: '1' })
   // No responders is not the broker's refusal: the record may have been stored.
-  await jsm.streams.delete('NATTER_SENT')
+  await jsm.streams.delete('NATTER_DEFAULT_SENT')
   try {
     expect((await send(s, worker)).isError).toBe(true)
   } finally {
@@ -266,7 +270,7 @@ test('a send whose record publish fails without a broker answer keeps its tokens
   const again = await send(s, worker)
   expect(again.isError).toBe(true)
   expect(await queued(worker)).toBe(0)
-  expect(await stored('NATTER_SENT')).toBe(0)
+  expect(await stored('NATTER_DEFAULT_SENT')).toBe(0)
 })
 
 test('a follow-up past the depth limit is rejected and publishes nothing', async () => {
@@ -275,16 +279,16 @@ test('a follow-up past the depth limit is rejected and publishes nothing', async
   const s = await startOrchestrator()
   const five = await storeSent(worker, 5)
   const four = await storeSent(worker, 4)
-  const records = await stored('NATTER_SENT')
+  const records = await stored('NATTER_DEFAULT_SENT')
 
   const rejected = await send(s, worker, { parent_task_id: five })
   expect(rejected.isError).toBe(true)
-  expect(await stored('NATTER_SENT')).toBe(records)
+  expect(await stored('NATTER_DEFAULT_SENT')).toBe(records)
   expect(await queued(worker)).toBe(0)
 
   const accepted = await send(s, worker, { parent_task_id: four })
   expect(accepted.isError).toBeFalsy()
-  const record = await jsm.direct.getMessage('NATTER_SENT', {
+  const record = await jsm.direct.getMessage('NATTER_DEFAULT_SENT', {
     last_by_subj: sentSubject(sentId(accepted)),
   })
   expect(record?.json<Sent>().depth).toBe(5)
@@ -309,19 +313,19 @@ test('results over the push budget are held unacked past ack_wait, then arrive o
   })
 
   await until(async () => resultPushes(s).length === 2)
-  const consumer = await jsm.consumers.info('NATTER_RESULTS', 'results')
+  const consumer = await jsm.consumers.info('NATTER_DEFAULT_RESULTS', 'results')
   // The held one is still the consumer's: delivered, not acked.
   expect(consumer.num_ack_pending + consumer.num_pending).toBeGreaterThan(0)
   expect(resultPushes(s)).toHaveLength(2)
 
   await until(async () => resultPushes(s).length === 3)
   await until(async () => {
-    const info = await jsm.consumers.info('NATTER_RESULTS', 'results')
+    const info = await jsm.consumers.info('NATTER_DEFAULT_RESULTS', 'results')
     return info.num_ack_pending === 0 && info.num_pending === 0
   })
   // working() kept the held one from coming back: three results, three deliveries.
   expect(
-    (await jsm.consumers.info('NATTER_RESULTS', 'results')).delivered
+    (await jsm.consumers.info('NATTER_DEFAULT_RESULTS', 'results')).delivered
       .consumer_seq,
   ).toBe(3)
   expect(
@@ -426,7 +430,7 @@ test('a burst past max_ack_pending with a short ack_wait pushes each result once
 
   await until(async () => resultPushes(s).length >= 12, 12_000)
   await until(async () => {
-    const info = await jsm.consumers.info('NATTER_RESULTS', 'results')
+    const info = await jsm.consumers.info('NATTER_DEFAULT_RESULTS', 'results')
     return info.num_ack_pending === 0 && info.num_pending === 0
   })
   const got = resultPushes(s).map(({ meta }) => meta.task_id)
@@ -459,7 +463,7 @@ const statusBytes = (
 /** Status messages written for a worker's tasks, as they happen. */
 const watchStatus = (worker: string) => {
   const seenStates: Status[] = []
-  const sub = nc.subscribe(`natter.status.${worker}.*`)
+  const sub = nc.subscribe(`natter.default.status.${worker}.*`)
   void (async () => {
     for await (const msg of sub) seenStates.push(msg.json<Status>())
   })()

@@ -1,26 +1,31 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, setDefaultTimeout, test } from 'bun:test'
 import {
   buildMeta,
   type Envelope,
   encodeEnvelope,
   type FailureReason,
+  fleetScope,
   mintTaskId,
   NUID_PATTERN,
   type ParsedMessage,
   type Presence,
   parseMessage,
   parseSubject,
-  presenceSubject,
   type Result,
-  resultSubject,
   type Sent,
   type Status,
   sanitizeContent,
+  type Task,
+} from '../src/protocol'
+import {
+  presenceSubject,
+  resultSubject,
   sentSubject,
   statusSubject,
-  type Task,
   taskSubject,
-} from '../src/protocol'
+} from './support/fleet'
+
+setDefaultTimeout(15_000)
 
 const ID = '0123456789abcdefghijAB' // 22 base62 characters
 const ID2 = 'ZZZZZZZZZZZZZZZZZZZZZZ'
@@ -169,21 +174,49 @@ describe('subjects', () => {
     expect(parseSubject(sentSubject(ID))).toEqual({ kind: 'sent', taskId: ID })
   })
 
+  test.each(['Default', 'a_b', '-x', '', 'a.b', '*', '>', 'x'.repeat(33)])(
+    'parseSubject rejects fleet token %p',
+    (fleet) => {
+      expect(parseSubject(`natter.${fleet}.task.w1`)).toBeUndefined()
+      expect(parseSubject(`natter.${fleet}.sent.${ID}`)).toBeUndefined()
+      expect(() => fleetScope(fleet)).toThrow()
+    },
+  )
+
+  test('a fleet scope names five streams and subjects of its own', () => {
+    const x = fleetScope('my-fleet')
+    expect(Object.values(x.streams).sort()).toEqual([
+      'NATTER_MY-FLEET_PRESENCE',
+      'NATTER_MY-FLEET_RESULTS',
+      'NATTER_MY-FLEET_SENT',
+      'NATTER_MY-FLEET_STATE',
+      'NATTER_MY-FLEET_TASKS',
+    ])
+    expect(parseSubject(x.taskSubject('w1'))).toEqual({
+      kind: 'task',
+      worker: 'w1',
+    })
+    // No subject of one fleet is a subject of another.
+    const other = fleetScope('other')
+    expect(x.taskSubject('w1')).not.toBe(other.taskSubject('w1'))
+    expect(x.resultSubject('w1', ID)).not.toBe(other.resultSubject('w1', ID))
+  })
+
   test.each([
-    'natter.task',
-    'natter.task.w1.extra',
-    `natter.result.w1`,
-    `natter.presence.w1.${ID}`,
+    'natter.default.task',
+    'natter.default.task.w1.extra',
+    `natter.default.result.w1`,
+    `natter.default.presence.w1.${ID}`,
     `natter.other.w1`,
     `other.task.w1`,
-    'natter.task.W1',
-    'natter.task.>',
-    `natter.result.*.${ID}`,
-    'natter.sent',
-    'natter.sent.w1',
-    'natter.sent.*',
-    `natter.sent.${ID}.extra`,
-    `natter.sent.w1.${ID}`,
+    'natter.default.task.W1',
+    'natter.default.task.>',
+    `natter.default.result.*.${ID}`,
+    'natter.default.sent',
+    'natter.default.sent.w1',
+    'natter.default.sent.*',
+    `natter.default.sent.${ID}.extra`,
+    `natter.default.sent.w1.${ID}`,
   ])('parseSubject rejects %p', (s) => {
     expect(parseSubject(s)).toBeUndefined()
   })
@@ -411,7 +444,7 @@ describe('subject binding', () => {
   })
 
   test('a non-protocol subject is rejected', () => {
-    expect(reasonOf('natter.task.w1.x', enc(task))).toBe('bad_subject')
+    expect(reasonOf('natter.default.task.w1.x', enc(task))).toBe('bad_subject')
   })
 })
 

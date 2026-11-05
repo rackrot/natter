@@ -2,7 +2,7 @@ import { connect } from '@nats-io/transport-node'
 import { resolveConfig, resolveTransport } from './config'
 import { connectOptions } from './connection'
 import { readHeld, setWaiting } from './held'
-import { encodeStatus, statusSubject } from './protocol'
+import { encodeStatus, fleetScope } from './protocol'
 
 // Hooks of plan 3.4. `bun src/hook.ts permission` runs on a `permission_prompt`
 // Notification and tells the orchestrator the held task waits on a human;
@@ -60,7 +60,7 @@ async function run(): Promise<void> {
       // Connecting took time: a release or a new task must not be overwritten.
       if (readHeld(sessionId)?.held.task_id !== file.held.task_id) return
       nc.publish(
-        statusSubject(config.name, file.held.task_id),
+        fleetScope(file.fleet).statusSubject(config.name, file.held.task_id),
         encodeStatus(config.name, file.held, state, note),
       )
       await nc.flush()

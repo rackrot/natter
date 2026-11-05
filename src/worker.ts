@@ -25,23 +25,17 @@ import {
   DIRECT_READ,
   encodeEnvelope,
   encodeStatus,
+  fleetScope,
   isReflected,
   type ParsedMessage,
   PROTOCOL_VERSION,
   parseMessage,
-  presenceSubject,
-  RESULTS_STREAM_NAME,
   type Result,
   ResultSchema,
-  resultSubject,
-  STATE_STREAM_NAME,
   type Status,
   StatusSchema,
   sanitizeContent,
-  statusSubject,
-  TASKS_STREAM_NAME,
   type Task,
-  taskSubject,
   WireError,
   workerDurable,
 } from './protocol'
@@ -164,6 +158,7 @@ export function createWorker({
 }): Worker {
   const timers = resolveTimers(env)
   const instance = nuid.next()
+  const scope = fleetScope(config.fleet)
   const durable = workerDurable(config.name)
   const stopping = new AbortController()
   let loop: Promise<void> | undefined
@@ -191,7 +186,7 @@ export function createWorker({
   function publishPresence(status: PresenceStatus): void {
     try {
       connection.nc?.publish(
-        presenceSubject(config.name),
+        scope.presenceSubject(config.name),
         presenceBytes(status),
       )
     } catch (err) {
@@ -266,6 +261,7 @@ export function createWorker({
           instance,
           attempt,
         },
+        fleet: config.fleet,
         url: config.url,
         seed_path: config.seedPath,
         ca_file: config.caFile,
@@ -423,7 +419,7 @@ export function createWorker({
     note?: unknown,
   ): void {
     nc.publish(
-      statusSubject(config.name, held.task.task_id),
+      scope.statusSubject(config.name, held.task.task_id),
       statusBytes(held, state, note),
     )
   }
@@ -467,8 +463,12 @@ export function createWorker({
   }
 
   const resultOnSubject = (nc: NatsConnection, taskId: string) =>
-    onStream(RESULTS_STREAM_NAME, () =>
-      lastMessage(nc, RESULTS_STREAM_NAME, resultSubject(config.name, taskId)),
+    onStream(scope.streams.results, () =>
+      lastMessage(
+        nc,
+        scope.streams.results,
+        scope.resultSubject(config.name, taskId),
+      ),
     )
 
   /** A real result: a reflected one proves nothing, so the task still runs. */
@@ -486,12 +486,12 @@ export function createWorker({
     taskId: string,
     bytes: Uint8Array,
   ): Promise<Stored> {
-    const subject = resultSubject(config.name, taskId)
+    const subject = scope.resultSubject(config.name, taskId)
     try {
       // No Nats-Msg-Id. Dedupe spans the stream and ACLs cannot reach headers, so
       // any worker could claim one and have this store answered as a duplicate.
       // The per-subject limit already makes a repeat safe.
-      await onStream(RESULTS_STREAM_NAME, () =>
+      await onStream(scope.streams.results, () =>
         jetstream(nc).publish(subject, bytes, {
           expect: { lastSubjectSequence: 0 },
         }),
@@ -610,9 +610,9 @@ export function createWorker({
     taskId: string,
     msg: JsMsg,
   ): Promise<number> {
-    const subject = statusSubject(config.name, taskId)
+    const subject = scope.statusSubject(config.name, taskId)
     try {
-      const stored = await lastMessage(nc, STATE_STREAM_NAME, subject)
+      const stored = await lastMessage(nc, scope.streams.state, subject)
       if (!stored) return 1
       const parsed = parseMessage(subject, stored.data)
       const reflected = isReflected(stored.header, DIRECT_READ)
@@ -668,10 +668,12 @@ export function createWorker({
     const content = sanitizeContent(`${task.title}\n\n${task.prompt}`)
     // No push without a stored record, or lost sessions would repeat attempt 1
     // forever and `max_attempts` would never fire.
-    const subject = statusSubject(config.name, task.task_id)
+    const subject = scope.statusSubject(config.name, task.task_id)
     const record = statusBytes({ task, attempt }, 'delivered')
     await retryHolding(msg, () =>
-      onStream(STATE_STREAM_NAME, () => jetstream(nc).publish(subject, record)),
+      onStream(scope.streams.state, () =>
+        jetstream(nc).publish(subject, record),
+      ),
     )
     if (stopping.signal.aborted) return
     const held = hold(nc, task, msg, attempt)
@@ -723,7 +725,7 @@ export function createWorker({
 
   async function ensureConsumer(jsm: JetStreamManager): Promise<void> {
     const settings = {
-      filter_subject: taskSubject(config.name),
+      filter_subject: scope.taskSubject(config.name),
       ack_wait: nanos(timers.ackWait),
       // One task at a time, across every session sharing this name.
       max_ack_pending: 1,
@@ -731,14 +733,14 @@ export function createWorker({
       max_deliver: -1,
     }
     try {
-      await jsm.consumers.add(TASKS_STREAM_NAME, {
+      await jsm.consumers.add(scope.streams.tasks, {
         ...settings,
         durable_name: durable,
         ack_policy: AckPolicy.Explicit,
       })
     } catch (err) {
       if (!isApiError(err, CONSUMER_ALREADY_EXISTS)) throw err
-      await jsm.consumers.update(TASKS_STREAM_NAME, durable, settings)
+      await jsm.consumers.update(scope.streams.tasks, durable, settings)
     }
   }
 
@@ -749,10 +751,10 @@ export function createWorker({
   ): Promise<void> {
     const jsm = await jetstreamManager(nc)
     await ensureConsumer(jsm)
-    missingStreams.delete(TASKS_STREAM_NAME)
+    missingStreams.delete(scope.streams.tasks)
     const consumer = await jsm
       .jetstream()
-      .consumers.get(TASKS_STREAM_NAME, durable)
+      .consumers.get(scope.streams.tasks, durable)
     messages = await consumer.consume({ abort_on_missing_resource: true })
     if (stopping.signal.aborted || released !== undefined) messages.stop()
     for await (const msg of messages) {
@@ -787,7 +789,7 @@ export function createWorker({
         })
       } catch (err) {
         if (isApiError(err, JetStreamApiCodes.StreamNotFound)) {
-          missingStreams.add(TASKS_STREAM_NAME)
+          missingStreams.add(scope.streams.tasks)
           log(bootstrapHint())
           await sleep(timers.streamRetry)
           continue
@@ -829,7 +831,7 @@ export function createWorker({
     bytes: Uint8Array,
   ): void {
     held.noteWrittenAt = performance.now()
-    nc.publish(statusSubject(config.name, held.task.task_id), bytes)
+    nc.publish(scope.statusSubject(config.name, held.task.task_id), bytes)
   }
 
   function flushNote(nc: NatsConnection, held: InFlight): void {

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { type JetStreamManager, jetstreamManager } from '@nats-io/jetstream'
 import { createUser } from '@nats-io/nkeys'
 import { connect, type NatsConnection } from '@nats-io/transport-node'
-import { bootstrapStreams } from '../src/bootstrap'
+import { bootstrapStreams } from './support/fleet'
 import { startNats, type TestNats } from './support/nats'
 
 // A Bun test timeout kills tracked subprocesses, including a shared nats-server.
@@ -65,21 +65,21 @@ test('every check passes on a bootstrapped server, and the seed is never printed
 })
 
 test('a missing stream fails by name and exits non-zero', async () => {
-  await jsm.streams.delete('NATTER_SENT')
+  await jsm.streams.delete('NATTER_DEFAULT_SENT')
   try {
     const { out, code } = await doctor(nats.url)
 
     expect(code).toBe(1)
-    expect(out).toMatch(/^FAIL stream NATTER_SENT:/m)
-    expect(out).not.toMatch(/^FAIL stream NATTER_TASKS:/m)
+    expect(out).toMatch(/^FAIL stream NATTER_DEFAULT_SENT:/m)
+    expect(out).not.toMatch(/^FAIL stream NATTER_DEFAULT_TASKS:/m)
   } finally {
     await bootstrapStreams(jsm)
   }
 })
 
 test('a drifted stream fails by name and exits non-zero', async () => {
-  const { config } = await jsm.streams.info('NATTER_RESULTS')
-  await jsm.streams.update('NATTER_RESULTS', {
+  const { config } = await jsm.streams.info('NATTER_DEFAULT_RESULTS')
+  await jsm.streams.update('NATTER_DEFAULT_RESULTS', {
     ...config,
     max_msgs_per_subject: 5,
   })
@@ -87,7 +87,9 @@ test('a drifted stream fails by name and exits non-zero', async () => {
     const { out, code } = await doctor(nats.url)
 
     expect(code).toBe(1)
-    expect(out).toMatch(/^FAIL stream NATTER_RESULTS:.*max_msgs_per_subject/m)
+    expect(out).toMatch(
+      /^FAIL stream NATTER_DEFAULT_RESULTS:.*max_msgs_per_subject/m,
+    )
   } finally {
     await bootstrapStreams(jsm)
   }
