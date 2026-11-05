@@ -18,11 +18,13 @@ import {
 import { z } from 'zod'
 import { type Config, type Env, resolveTimers } from './config'
 import type { Connection } from './connection'
+import { clearHeld, writeHeld } from './held'
 import { type PresenceStatus, presenceEncoder } from './presence'
 import {
   buildMeta,
   DIRECT_READ,
   encodeEnvelope,
+  encodeStatus,
   isReflected,
   type ParsedMessage,
   PROTOCOL_VERSION,
@@ -243,6 +245,36 @@ export function createWorker({
     }
   }
 
+  // For the permission hook (plan 3.4). Best effort: it must never touch task
+  // handling, so a failed write is logged and nothing more.
+  const sessionId = env.CLAUDE_CODE_SESSION_ID
+  function recordHeld(held: InFlight | undefined): void {
+    try {
+      if (!held) {
+        clearHeld(sessionId)
+        return
+      }
+      const { task, attempt } = held
+      writeHeld(sessionId, {
+        held: {
+          task_id: task.task_id,
+          title: task.title,
+          created_at: task.created_at,
+          depth: task.depth,
+          timeout_s: task.timeout_s,
+          queue_ttl_s: task.queue_ttl_s,
+          instance,
+          attempt,
+        },
+        url: config.url,
+        seed_path: config.seedPath,
+        ca_file: config.caFile,
+      })
+    } catch (err) {
+      log(`held file failed: ${describeError(err)}`)
+    }
+  }
+
   function hold(
     nc: NatsConnection,
     task: Task,
@@ -263,6 +295,7 @@ export function createWorker({
       ),
     }
     inFlight = held
+    recordHeld(held)
     announce()
     return held
   }
@@ -273,7 +306,10 @@ export function createWorker({
     // A note still waiting is dropped: the task is over, or handed back.
     clearTimeout(held.noteTimer)
     held.noteTimer = undefined
-    if (inFlight === held) inFlight = undefined
+    if (inFlight === held) {
+      inFlight = undefined
+      recordHeld(undefined)
+    }
     announce()
   }
 
@@ -362,23 +398,21 @@ export function createWorker({
     state: Status['state'],
     note?: unknown,
   ): Uint8Array {
-    const encoded = encodeEnvelope({
-      v: PROTOCOL_VERSION,
-      type: 'status',
-      task_id: task.task_id,
-      worker: config.name,
-      title: task.title,
-      created_at: task.created_at,
+    return encodeStatus(
+      config.name,
+      {
+        task_id: task.task_id,
+        title: task.title,
+        created_at: task.created_at,
+        depth: task.depth,
+        timeout_s: task.timeout_s,
+        queue_ttl_s: task.queue_ttl_s,
+        instance,
+        attempt,
+      },
       state,
-      instance,
-      attempt,
       note,
-      depth: task.depth,
-      timeout_s: task.timeout_s,
-      queue_ttl_s: task.queue_ttl_s,
-    })
-    if (!encoded.ok) throw new WireError(encoded.issues.join('; '))
-    return encoded.bytes
+    )
   }
 
   // Core publish: losing one of these is fine. `delivered` is not, see deliver().
@@ -861,6 +895,8 @@ export function createWorker({
 
   return {
     start() {
+      // A resumed session id may leave a file from a server that was killed.
+      recordHeld(undefined)
       loop ??= run()
       beating ??= beat()
     },

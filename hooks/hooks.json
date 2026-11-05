@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$NATTER_ROLE\" ] || exit 0; bun \"${CLAUDE_PLUGIN_ROOT}/src/hook.ts\" permission >/dev/null 2>&1; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$NATTER_ROLE\" ] && [ -e \"$HOME/.local/state/natter/held/$CLAUDE_CODE_SESSION_ID.waiting\" ] || exit 0; bun \"${CLAUDE_PLUGIN_ROOT}/src/hook.ts\" resumed >/dev/null 2>&1; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

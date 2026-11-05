@@ -86,6 +86,7 @@ const PUSH_LIMIT: Record<AttentionReason, number> = {
   stale: MAX_STALE_PUSHES,
   released: 1,
   overdue: 1,
+  waiting_permission: 1,
 }
 const NOT_FOUND = 404
 const NO_RESPONDERS = 503
@@ -841,7 +842,9 @@ export function createOrchestrator({
       timers.acceptTimeout
 
   const isHeld = (row: Status | undefined) =>
-    row?.state === 'delivered' || row?.state === 'accepted'
+    row?.state === 'delivered' ||
+    row?.state === 'accepted' ||
+    row?.state === 'waiting_permission'
 
   /**
    * Plan 3.5. Starts from the records and reads only the subjects they name, so
@@ -883,6 +886,15 @@ export function createOrchestrator({
           }
         }
         if (row?.state === 'released') reasons.push('released')
+        // Alive and busy with this task: a release or a kill -9 leaves a row behind.
+        if (
+          row?.state === 'waiting_permission' &&
+          claimed &&
+          msg &&
+          !isStale(msg, timers.stale)
+        ) {
+          reasons.push('waiting_permission')
+        }
         if (isOverdue(sent)) reasons.push('overdue')
         for (const reason of reasons) {
           if (isOwed(sent, reason)) due.push({ sent, reason })

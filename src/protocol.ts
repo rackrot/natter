@@ -131,7 +131,12 @@ const REASONS = [
   'invalid_task',
 ] as const
 /** Why a task needs a look (plan 3.5). In `meta` only, never on the wire. */
-export const ATTENTION_REASONS = ['stale', 'released', 'overdue'] as const
+export const ATTENTION_REASONS = [
+  'stale',
+  'released',
+  'overdue',
+  'waiting_permission',
+] as const
 export type AttentionReason = (typeof ATTENTION_REASONS)[number]
 
 const utf8Bytes = (s: string) => Buffer.byteLength(s, 'utf8')
@@ -279,7 +284,14 @@ export const StatusSchema = z.object({
   worker: name,
   title: bounded(120, 1),
   created_at: timestamp,
-  state: z.enum(['delivered', 'accepted', 'stalled', 'released', 'finished']),
+  state: z.enum([
+    'delivered',
+    'accepted',
+    'waiting_permission',
+    'stalled',
+    'released',
+    'finished',
+  ]),
   instance: nuid.optional(),
   attempt: positive.optional(),
   note: bounded(512).optional(),
@@ -307,6 +319,17 @@ export type Task = z.infer<typeof TaskSchema>
 export type Sent = z.infer<typeof SentSchema>
 export type Result = z.infer<typeof ResultSchema>
 export type Status = z.infer<typeof StatusSchema>
+
+/** What a status row needs from the task it describes; also the hook's file. */
+export const HeldSchema = StatusSchema.pick({
+  task_id: true,
+  title: true,
+  created_at: true,
+  depth: true,
+  timeout_s: true,
+  queue_ttl_s: true,
+}).extend({ instance: nuid, attempt: positive })
+export type Held = z.infer<typeof HeldSchema>
 export type Presence = z.infer<typeof PresenceSchema>
 export type Envelope = Task | Sent | Result | Status | Presence
 export type EnvelopeType = Envelope['type']
@@ -359,6 +382,25 @@ export function encodeEnvelope(input: unknown): Encoded {
     return { ok: false, issues: [`(root): at most ${MAX_MESSAGE_BYTES} bytes`] }
   }
   return { ok: true, bytes, envelope: parsed.data }
+}
+
+/** A status row for a held task; throws WireError when it does not encode. */
+export function encodeStatus(
+  worker: string,
+  held: Held,
+  state: Status['state'],
+  note?: unknown,
+): Uint8Array {
+  const encoded = encodeEnvelope({
+    ...held,
+    v: PROTOCOL_VERSION,
+    type: 'status',
+    worker,
+    state,
+    note,
+  })
+  if (!encoded.ok) throw new WireError(encoded.issues.join('; '))
+  return encoded.bytes
 }
 
 export type FailureReason =
