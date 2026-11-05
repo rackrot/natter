@@ -29,6 +29,18 @@ const RESTART_MAX_MS = 15_000
 const HEARTBEAT_MS = 15_000
 const STALE_MS = 45_000
 const ATTENTION_SWEEP_MS = 30_000
+// The window every per-minute limit of plan 3.7 is counted over.
+const RATE_WINDOW_MS = 60_000
+// The shortest gap between two `accepted` status writes for one task.
+const STATUS_WINDOW_MS = 5000
+// Plan 3.7 loop guards. Per process, in memory: a restart starts fresh.
+const SEND_PER_WORKER = 6
+const SEND_GLOBAL = 30
+const PUSH_BUDGET = 30
+// Attention pushes have a budget of their own, so a result backlog cannot
+// hold them off.
+const ATTENTION_PER_WINDOW = 10
+const MAX_DEPTH = 5
 
 export type Role = 'orchestrator' | 'worker'
 
@@ -182,6 +194,24 @@ export function resolveTimers(env: Env) {
     stale: ms('STALE', STALE_MS),
     attentionSweep: ms('ATTENTION_SWEEP', ATTENTION_SWEEP_MS),
     resultsMaxAge: ms('RESULTS_MAX_AGE', RESULTS_MAX_AGE_MS),
+    rateWindow: ms('RATE_WINDOW', RATE_WINDOW_MS),
+    statusWindow: ms('STATUS_WINDOW', STATUS_WINDOW_MS),
+  }
+}
+
+/** Plan 3.7 loop guards, per `rateWindow`. Tests lower them with `NATTER_TEST_*`. */
+export function resolveLimits(env: Env) {
+  const count = (key: string, fallback: number) => {
+    // Whole numbers of at least 1: a fraction rounds down, anything else is unset.
+    const value = Math.floor(Number(env[`NATTER_TEST_${key}`]))
+    return Number.isSafeInteger(value) && value >= 1 ? value : fallback
+  }
+  return {
+    sendPerWorker: count('SEND_PER_WORKER', SEND_PER_WORKER),
+    sendGlobal: count('SEND_GLOBAL', SEND_GLOBAL),
+    pushBudget: count('PUSH_BUDGET', PUSH_BUDGET),
+    attentionBudget: count('ATTENTION_BUDGET', ATTENTION_PER_WINDOW),
+    maxDepth: count('MAX_DEPTH', MAX_DEPTH),
   }
 }
 

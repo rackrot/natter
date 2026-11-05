@@ -6,6 +6,7 @@ import {
   adminConfig,
   type Config,
   resolveConfig,
+  resolveLimits,
   resolveTransport,
 } from '../src/config'
 import { startConnection } from '../src/connection'
@@ -353,4 +354,16 @@ describe('server process', () => {
       await s.close()
     }
   })
+})
+
+test('limit overrides take whole numbers of at least 1 and ignore the rest', () => {
+  const limits = (value: string) =>
+    resolveLimits({ NATTER_TEST_SEND_PER_WORKER: value }).sendPerWorker
+  const fallback = resolveLimits({}).sendPerWorker
+
+  expect(limits('2')).toBe(2)
+  expect(limits('2.9')).toBe(2)
+  for (const bad of ['0', '-3', '0.5', 'soon', '', 'Infinity']) {
+    expect(limits(bad)).toBe(fallback)
+  }
 })

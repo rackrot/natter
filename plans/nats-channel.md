@@ -354,13 +354,13 @@ Rejected: nkey signatures on each envelope (protects against a compromised broke
 | `send_task` rate global | 30 per minute | orchestrator server, hard |
 | `depth` from `parent_task_id` | 5 | orchestrator server; only binds when Claude sets the parent, so it is a correlation aid first |
 | Result pushes to Claude | 30 per minute; held unacked while limited | orchestrator server, hard |
-| Attention pushes to Claude | 20 per sweep, and from S8 they spend the same 30 per minute as results; capped ones stay owed | orchestrator server, hard |
+| Attention pushes to Claude | 20 per sweep, and from S8 also 10 per minute (`ATTENTION_PER_WINDOW`), a budget apart from the results' 30 so a held-result backlog cannot delay them; capped ones stay owed | orchestrator server, hard |
 | Tasks in flight per worker | 1 | broker, hard |
 | `update_task` writes | one per 5s, coalesced; never pushed | worker server |
 
 Rejected: a dedupe on identical `(to, prompt)`: legitimate retries look the same, and the rate limit already bounds the damage.
 
-**Config defaults**, as named constants in `src/config.ts`. `timeout_s` and `max_attempts` can be set per task. Tests need short timers, so all of them are overridable through `NATTER_TEST_*_MS` env, `NATTER_TEST_ACCEPT_TIMEOUT_MS` for the accept timeout.
+**Config defaults**, as named constants in `src/config.ts`. `timeout_s` and `max_attempts` can be set per task. Tests need short timers, so every timer is overridable through `NATTER_TEST_*_MS` env, `NATTER_TEST_ACCEPT_TIMEOUT_MS` for the accept timeout. The count limits take `NATTER_TEST_SEND_PER_WORKER`, `_SEND_GLOBAL`, `_PUSH_BUDGET`, `_ATTENTION_BUDGET` and `_MAX_DEPTH`, whole numbers of at least 1; anything else is ignored.
 
 | Constant | Default |
 | --- | --- |
@@ -470,9 +470,9 @@ Each slice leaves `mise run check` green. Tests run against a real `nats-server`
 
 ### S8. Rate and loop limits
 
-- Files: `src/orchestrator.ts`, `test/limits.test.ts`.
+- Files: `src/orchestrator.ts`, `src/worker.ts` (the `update_task` window), `src/config.ts` (limit constants, `NATTER_TEST_*` overrides), `test/limits.test.ts`; `test/orchestrator.test.ts` and `test/worker.test.ts` raise the limits their own tests would otherwise hit.
 - Depends on: S6.
-- Acceptance: exceeding the per-worker or global rate returns `isError` and publishes nothing; depth 6 is rejected; result pushes beyond the limit are held, not acked, and arrive later; attention pushes spend the same budget and stay owed while limited; `update_task` bursts write at most one status per window.
+- Acceptance: exceeding the per-worker or global rate returns `isError` and publishes nothing; depth 6 is rejected; result pushes beyond the limit are held, not acked, and arrive later; attention pushes have their own budget (10 per window) and stay owed while limited; `update_task` bursts write at most one status per window. A send takes its tokens only when it goes ahead (checked before the `NATTER_SENT` record) and gets them back if the broker answers with a refusal; one that may have landed, a timeout included, keeps them spent. A held result stays unacked and the wait calls `working()`; coalesced notes are dropped when the task finishes and written on stop.
 - Cheapest check: `bun test test/limits.test.ts`.
 - Worker: mechanical.
 

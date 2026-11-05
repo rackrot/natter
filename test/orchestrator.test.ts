@@ -79,6 +79,9 @@ const orchestratorEnv = (url: string, env: Record<string, string> = {}) => ({
   NATTER_TEST_STREAM_RETRY_MS: '100',
   NATTER_TEST_RESTART_MIN_MS: '100',
   NATTER_TEST_RESTART_MAX_MS: '300',
+  // Out of the way: test/limits.test.ts owns the rate limits.
+  NATTER_TEST_SEND_PER_WORKER: '1000',
+  NATTER_TEST_SEND_GLOBAL: '1000',
   ...env,
 })
 

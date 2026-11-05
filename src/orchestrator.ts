@@ -24,6 +24,7 @@ import {
   DEFAULT_TIMEOUT_S,
   type Env,
   OVERDUE_MARGIN_S,
+  resolveLimits,
   resolveTimers,
 } from './config'
 import type { Connection } from './connection'
@@ -174,6 +175,51 @@ interface Due {
 
 const dueKey = ({ sent, reason }: Due) => `${sent.task_id}.${reason}`
 
+/** Plan 3.7: `capacity` tokens a `windowMs`, refilled steadily, starting full. */
+class TokenBucket {
+  private tokens: number
+  private at = performance.now()
+
+  constructor(
+    private readonly capacity: number,
+    private readonly windowMs: number,
+  ) {
+    this.tokens = capacity
+  }
+
+  private refill(): void {
+    // Monotonic: a clock step must not mint or burn tokens.
+    const now = performance.now()
+    const earned = ((now - this.at) * this.capacity) / this.windowMs
+    this.tokens = Math.min(this.capacity, this.tokens + earned)
+    this.at = now
+  }
+
+  has(): boolean {
+    this.refill()
+    return this.tokens >= 1
+  }
+
+  take(): boolean {
+    if (!this.has()) return false
+    this.tokens -= 1
+    return true
+  }
+
+  give(): void {
+    this.tokens = Math.min(this.capacity, this.tokens + 1)
+  }
+
+  /** Milliseconds until a token is there. */
+  waitMs(): number {
+    this.refill()
+    return Math.max(
+      1,
+      Math.ceil(((1 - this.tokens) * this.windowMs) / this.capacity),
+    )
+  }
+}
+
 const reply = (value: unknown): ToolResult => ({
   // The only way a tool answers with stored text: all of it came off the wire.
   content: [{ type: 'text', text: JSON.stringify(sanitizeJson(value)) }],
@@ -237,6 +283,7 @@ export function createOrchestrator({
   env: Env
 }): Orchestrator {
   const timers = resolveTimers(env)
+  const limits = resolveLimits(env)
   const stopping = new AbortController()
   let loop: Promise<void> | undefined
   let sweeping: Promise<void> | undefined
@@ -248,6 +295,17 @@ export function createOrchestrator({
   // Attention already raised, by task. An entry leaves when its task leaves the
   // sweep's window, so this holds at most MAX_SCANNED tasks.
   const raised = new Map<string, Raised>()
+  // Plan 3.7 rate guards. A worker's bucket exists only once a send to it has
+  // passed addressedState, so the map holds names that have started.
+  const sendGlobal = new TokenBucket(limits.sendGlobal, timers.rateWindow)
+  const sendByWorker = new Map<string, TokenBucket>()
+  // Results are held for this budget. Attention has its own, so a backlog of
+  // held results never delays it.
+  const pushBudget = new TokenBucket(limits.pushBudget, timers.rateWindow)
+  const attentionBudget = new TokenBucket(
+    limits.attentionBudget,
+    timers.rateWindow,
+  )
   // Where the last sweep stopped pushing, so a cut-off sweep moves on from there.
   let attentionCursor = ''
 
@@ -561,6 +619,8 @@ export function createOrchestrator({
     task: Task,
     taskBytes: Uint8Array,
     recordBytes: Uint8Array,
+    /** The broker refused: nothing was queued, so the send's tokens go back. */
+    refunded: () => void,
   ): Promise<ToolResult | undefined> {
     const js = jetstream(nc)
     try {
@@ -568,6 +628,8 @@ export function createOrchestrator({
         msgID: task.task_id,
       })
     } catch (err) {
+      // A timeout may have stored the record, so only the broker's answer refunds.
+      if (err instanceof JetStreamApiError) refunded()
       return toolError(`not sent: ${failure(err)}`)
     }
     try {
@@ -579,11 +641,13 @@ export function createOrchestrator({
     } catch (err) {
       // Only the broker's own answer is final, because dedupe runs before its
       // limits. No responders can follow an earlier try that landed unacked.
-      return err instanceof JetStreamApiError
-        ? toolError(`not sent: ${failure(err)}`)
-        : toolError(
-            `task ${task.task_id} may or may not be queued, check list_tasks before sending again: ${failure(err)}`,
-          )
+      if (err instanceof JetStreamApiError) {
+        refunded()
+        return toolError(`not sent: ${failure(err)}`)
+      }
+      return toolError(
+        `task ${task.task_id} may or may not be queued, check list_tasks before sending again: ${failure(err)}`,
+      )
     }
   }
 
@@ -598,6 +662,11 @@ export function createOrchestrator({
       const record = await readRecord(await manager(nc), parent)
       if (!record) return toolError('unknown parent_task_id')
       const { root_task_id, depth } = record.sent
+      if (depth + 1 > limits.maxDepth) {
+        return toolError(
+          `parent_task_id is already ${depth} deep: at most ${limits.maxDepth} levels of follow-up tasks`,
+        )
+      }
       lineage = { root_task_id, depth: depth + 1 }
     }
     // Named fields only: identity, timestamps and lineage are the plugin's.
@@ -639,9 +708,34 @@ export function createOrchestrator({
       return toolError(UNKNOWN_WORKER)
     }
 
+    // Before anything is published, record included. No await from the check to
+    // the take, so concurrent sends cannot both pass on the last token. A token
+    // is spent only by a send that goes ahead: the broker's refusal returns it,
+    // while a send that may have landed keeps it spent.
+    const workerBucket =
+      sendByWorker.get(to) ??
+      new TokenBucket(limits.sendPerWorker, timers.rateWindow)
+    sendByWorker.set(to, workerBucket)
+    if (!workerBucket.has() || !sendGlobal.has()) {
+      return toolError(
+        'send_task rate limit reached: too many tasks sent recently. Wait before sending more, and check whether this loop should continue',
+      )
+    }
+    workerBucket.take()
+    sendGlobal.take()
+
     sending.add(task_id)
     try {
-      const refused = await publish(nc, task, encoded.bytes, record.bytes)
+      const refused = await publish(
+        nc,
+        task,
+        encoded.bytes,
+        record.bytes,
+        () => {
+          workerBucket.give()
+          sendGlobal.give()
+        },
+      )
       return refused ?? reply({ task_id, worker_state })
     } finally {
       sending.delete(task_id)
@@ -703,6 +797,14 @@ export function createOrchestrator({
           ? Buffer.byteLength(JSON.stringify(result.data))
           : 0,
       })
+      // Held, not acked: working() keeps the broker from redelivering it as a
+      // repeat while it waits. Later messages wait behind it, and `pushed`
+      // answers any copy that is redelivered meanwhile.
+      while (!pushBudget.take()) {
+        if (stopping.signal.aborted) return
+        msg.working()
+        await sleep(Math.min(pushBudget.waitMs(), timers.working))
+      }
       await push(sanitizeContent(result.summary), meta)
       pushed.add(msg.subject)
     }
@@ -796,6 +898,8 @@ export function createOrchestrator({
     const turn = [...due.slice(from), ...due.slice(0, from)]
     for (const item of turn.slice(0, MAX_ATTENTION_PER_SWEEP)) {
       if (stopping.signal.aborted) return
+      // Owed, not dropped: the cursor stays and the next sweep starts here.
+      if (!attentionBudget.take()) return
       await raise(item)
       attentionCursor = dueKey(item)
     }

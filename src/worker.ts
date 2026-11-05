@@ -94,6 +94,11 @@ interface InFlight {
   accepted: boolean
   /** finish_task or the run timeout is writing the result. Never both. */
   finishing: boolean
+  /** `performance.now()` of the last `accepted` write from update_task. */
+  noteWrittenAt: number
+  /** The latest note inside the window, written when it ends. Last one wins. */
+  pendingNote?: Uint8Array
+  noteTimer?: ReturnType<typeof setTimeout>
 }
 
 /**
@@ -249,6 +254,7 @@ export function createWorker({
       attempt,
       accepted: false,
       finishing: false,
+      noteWrittenAt: Number.NEGATIVE_INFINITY,
       working: keepWorking(() => held.msg),
       deadline: setTimeout(
         () => releaseUnaccepted(nc, held),
@@ -263,6 +269,9 @@ export function createWorker({
   function release(held: InFlight): void {
     clearInterval(held.working)
     clearTimeout(held.deadline)
+    // A note still waiting is dropped: the task is over, or handed back.
+    clearTimeout(held.noteTimer)
+    held.noteTimer = undefined
     if (inFlight === held) inFlight = undefined
     announce()
   }
@@ -761,8 +770,42 @@ export function createWorker({
     held: InFlight,
     args: Record<string, unknown> | undefined,
   ): ToolResult {
-    publishStatus(nc, held, 'accepted', args?.note)
+    // Encoded now, so a bad note fails this call whether or not it is written.
+    const bytes = statusBytes(held, 'accepted', args?.note)
+    const wait = held.noteWrittenAt + timers.statusWindow - performance.now()
+    if (wait <= 0 && held.noteTimer === undefined) {
+      writeNote(nc, held, bytes)
+    } else {
+      held.pendingNote = bytes
+      held.noteTimer ??= setTimeout(
+        () => {
+          held.noteTimer = undefined
+          flushNote(nc, held)
+        },
+        Math.max(wait, 0),
+      )
+    }
     return reply('recorded')
+  }
+
+  function writeNote(
+    nc: NatsConnection,
+    held: InFlight,
+    bytes: Uint8Array,
+  ): void {
+    held.noteWrittenAt = performance.now()
+    nc.publish(statusSubject(config.name, held.task.task_id), bytes)
+  }
+
+  function flushNote(nc: NatsConnection, held: InFlight): void {
+    const bytes = held.pendingNote
+    held.pendingNote = undefined
+    if (!bytes) return
+    try {
+      writeNote(nc, held, bytes)
+    } catch (err) {
+      log(`status failed: ${describeError(err)}`)
+    }
   }
 
   async function finishTask(
@@ -829,6 +872,8 @@ export function createWorker({
       // delivery can start holding from here: it rechecks the signal first.
       const held = inFlight
       if (held) {
+        // The last note is the one a reader would have seen, so write it.
+        if (connection.nc) flushNote(connection.nc, held)
         release(held)
         // A result on its way settles the task, redelivered or not.
         if (!held.finishing) handBack(held.msg)

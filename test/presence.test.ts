@@ -77,6 +77,9 @@ const sessionEnv = (url: string) => ({
   NATTER_TEST_HEARTBEAT_MS: String(HEARTBEAT_MS),
   NATTER_TEST_STALE_MS: String(STALE_MS),
   NATTER_TEST_ATTENTION_SWEEP_MS: String(SWEEP_MS),
+  // Out of the way: test/limits.test.ts owns the push budgets.
+  NATTER_TEST_ATTENTION_BUDGET: '100000',
+  NATTER_TEST_PUSH_BUDGET: '100000',
 })
 
 const startWorker = async (

@@ -68,6 +68,8 @@ const workerEnv = (name: string, url: string, env = {}) => ({
   NATTER_TEST_STARTUP_GRACE_MS: String(GRACE_MS),
   NATTER_TEST_STREAM_RETRY_MS: '100',
   NATTER_TEST_RESTART_MIN_MS: '100',
+  // Notes are coalesced per window: test/limits.test.ts owns that.
+  NATTER_TEST_STATUS_WINDOW_MS: '20',
   ...env,
 })
 
