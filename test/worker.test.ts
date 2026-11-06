@@ -590,7 +590,11 @@ test('a bad envelope carrying the held task_id cannot pass for its result', asyn
 
   await forgetHeldTask(name)
   await publishRaw(name, JSON.stringify({ ...held, timeout_s: -1 }))
-  await until(async () => terminated.length === 1)
+  // Deleting the held message raises an advisory of its own, so wait for the
+  // worker's: it has to have rejected the envelope before the task finishes.
+  await until(async () =>
+    terminated.some((t) => (t as { reason?: string }).reason === 'invalid'),
+  )
 
   expect(await storedResult(name, held.task_id)).toBeUndefined()
   const res = await finish(s, held.task_id, { summary: 'the real work' })
