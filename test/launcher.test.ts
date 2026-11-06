@@ -25,6 +25,7 @@ const CHANNEL = [
   'plugin:nats-channel@natter',
 ]
 const WORKER_SETTINGS = join(ROOT, 'config', 'worker.settings.json')
+const ORCHESTRATOR_SETTINGS = join(ROOT, 'config', 'orchestrator.settings.json')
 
 let sb: Sandbox
 let repo: string
@@ -54,6 +55,10 @@ async function dryHere(
 }
 
 const worker = (...args: string[]) => ['worker', ...args]
+const orchestrator = (...args: string[]) => ['orchestrator', ...args]
+/** Where an orchestrator of the fleet runs, under the sandbox's XDG_STATE_HOME. */
+const stateDir = (fleet: string) =>
+  join(sb.state, 'natter', 'orchestrator', fleet)
 
 describe('dry run, in this terminal', () => {
   const expectedArgv = (dir: string, ...claudeArgs: string[]) => [
@@ -136,17 +141,102 @@ describe('dry run, in this terminal', () => {
     expect(l.argv.at(-1)).toBe('--resume')
   })
 
-  // S7 restores the orchestrator cases and removes this refusal.
-  test('an orchestrator is refused until S7, and claude is never started', async () => {
+  test('an orchestrator runs the read-only agent in its per-fleet state directory', async () => {
+    const l = await dryHere(
+      orchestrator(
+        '--fleet',
+        'x',
+        '--here',
+        '--',
+        '--resume',
+        '--model',
+        'opus',
+      ),
+    )
+    expect(l.set).toEqual({
+      NATTER_ROLE: 'orchestrator',
+      NATTER_FLEET: 'x',
+      NATTER_NAME: 'orchestrator',
+      NATTER_PROVISION: '1',
+    })
+    expect(l.unset).toEqual(['CLAUDE_ORCHESTRATE_AGENT'])
+    expect(l.argv).toEqual([
+      'claude-orchestrate',
+      '--no-herdr',
+      '-a',
+      'nats-channel:orchestrator',
+      stateDir('x'),
+      '--',
+      ...CHANNEL,
+      '--settings',
+      ORCHESTRATOR_SETTINGS,
+      '--resume',
+      '--model',
+      'opus',
+    ])
+  })
+
+  test('an orchestrator in a herdr pane stays in the pane', async () => {
+    const l = await dryHere(orchestrator('--fleet', 'x'), { HERDR_ENV: '1' })
+    expect(l.argv[2]).toBe('-a')
+    expect(l.argv[4]).toBe(stateDir('x'))
+  })
+
+  test('only an orchestrator provisions, and its directory ignores the working directory', async () => {
+    const w = await dryHere(worker('--fleet', 'x', '--here', repo))
+    expect(w.set).not.toHaveProperty('NATTER_PROVISION')
+    const ran = await runNatter(
+      sb,
+      ['-n', ...orchestrator('--fleet', 'x', '--here')],
+      {
+        cwd: spaced,
+      },
+    )
+    expect(
+      parseEnvCommand(dryCommands(ran.stdout)[0] as string[]).argv[4],
+    ).toBe(stateDir('x'))
+  })
+
+  test('the state directory follows XDG_STATE_HOME, then ~/.local/state', async () => {
+    const xdg = await dryHere(orchestrator('--fleet', 'x', '--here'), {
+      XDG_STATE_HOME: join(sb.root, 'elsewhere'),
+    })
+    expect(xdg.argv[4]).toBe(
+      join(sb.root, 'elsewhere', 'natter', 'orchestrator', 'x'),
+    )
+    const ran = await runNatter(
+      sb,
+      ['-n', ...orchestrator('--fleet', 'x', '--here')],
+      {
+        env: { XDG_STATE_HOME: '' },
+      },
+    )
+    expect(
+      parseEnvCommand(dryCommands(ran.stdout)[0] as string[]).argv[4],
+    ).toBe(join(sb.home, '.local', 'state', 'natter', 'orchestrator', 'x'))
+  })
+
+  test('two fleets get two directories, created on a real run', async () => {
+    for (const fleet of ['one', 'two']) {
+      expect(
+        (await runNatter(sb, orchestrator('--fleet', fleet, '--here'))).code,
+      ).toBe(0)
+    }
+    expect(await readdir(join(sb.state, 'natter', 'orchestrator'))).toEqual(
+      expect.arrayContaining(['one', 'two']),
+    )
+  })
+
+  test('an orchestrator takes no --name and no directory, and nothing is launched', async () => {
     await rm(sb.coLog, { force: true })
     for (const args of [
-      ['orchestrator', '--fleet', 'x', '--here'],
-      ['orchestrator', '--fleet', 'x'],
-      ['orchestrator', '-n', '--fleet', 'x', '--here'],
+      orchestrator('--fleet', 'x', '--here', '--name', 'boss'),
+      orchestrator('--fleet', 'x', '--here', repo),
     ]) {
-      const ran = await runNatter(sb, args, { env: { HERDR_ENV: '1' } })
+      const ran = await runNatter(sb, ['-n', ...args])
       expect(ran.code).not.toBe(0)
       expect(ran.stdout).toBe('')
+      expect((await runNatter(sb, args)).code).not.toBe(0)
     }
     expect(await Bun.file(sb.coLog).exists()).toBe(false)
   })
@@ -213,6 +303,31 @@ describe('dry run, new workspace', () => {
     ])
     expect(lines.flat().join(' ')).not.toContain('NATTER_ROLE')
   })
+
+  test('an orchestrator workspace starts in the state directory and re-enters with its claude args', async () => {
+    const ran = await runNatter(
+      sb,
+      ['-n', ...orchestrator('--fleet', 'x', '-w', '--', '--resume', 'a b')],
+      { env: { HERDR_ENV: '1' } },
+    )
+    expect(ran.code).toBe(0)
+    const lines = dryCommands(ran.stdout)
+    const create = lines.find((l) => l[2] === 'create') as string[]
+    expect(
+      create.slice(create.indexOf('--cwd'), create.indexOf('--cwd') + 4),
+    ).toEqual(['--cwd', stateDir('x'), '--label', 'x:orchestrator'])
+    const run = lines.find((l) => l[2] === 'run') as string[]
+    expect(splitLine(run[4] as string)).toEqual([
+      NATTER_BIN,
+      'orchestrator',
+      '--fleet',
+      'x',
+      '--here',
+      '--',
+      '--resume',
+      'a b',
+    ])
+  })
 })
 
 describe('stub run equals the dry run', () => {
@@ -240,6 +355,10 @@ describe('stub run equals the dry run', () => {
     'in a herdr pane': {
       args: worker('--fleet', 'x', '--name', 'api', repo),
       env: { HERDR_ENV: '1', CLAUDE_ORCHESTRATE_AGENT: 'other' },
+    },
+    orchestrator: {
+      args: orchestrator('--fleet', 'x', '--here', '--', '--resume'),
+      env: { NATTER_NAME: 'leaked', CLAUDE_ORCHESTRATE_AGENT: 'other' },
     },
   })
   for (const label of Object.keys(cases())) {
@@ -321,6 +440,17 @@ describe('stub herdr', () => {
       '--resume',
     ])
     expect(calls[2]).toContain('w9:p1')
+  })
+
+  test('an orchestrator workspace is created in a directory that exists', async () => {
+    const calls = await bareHerdr(orchestrator('--fleet', 'ws', '-d'), {})
+    const create = calls.find((c) => c[0] === 'workspace') as string[]
+    const cwd = create[create.indexOf('--cwd') + 1] as string
+    expect(cwd).toBe(stateDir('ws'))
+    expect((await readdir(cwd)).length).toBe(0)
+    const sent = calls.flat().join(' ')
+    expect(sent).not.toContain('NATTER_PROVISION')
+    expect(sent).not.toContain('NATTER_ROLE')
   })
 
   test('inside herdr there is no attach', async () => {
@@ -405,6 +535,27 @@ describe('stub herdr, round trip and failures', () => {
       expect(words).toContain('=ls')
     },
   )
+
+  test('the line typed for an orchestrator launches what a direct --here run does', async () => {
+    await rm(sb.herdrLog, { force: true })
+    const ran = await runNatter(
+      sb,
+      orchestrator('--fleet', 'x', '-d', '--', ...WORDS),
+    )
+    expect(ran.code).toBe(0)
+    const run = (await readHerdrCalls(sb)).find((c) => c[1] === 'run')
+    const typed = splitLine(run?.[3] as string)
+    expect(
+      (await runNatter(sb, typed.slice(1), { env: { HERDR_ENV: '1' } })).code,
+    ).toBe(0)
+    const viaPane = await readStubRun(sb)
+    const direct = orchestrator('--fleet', 'x', '--here', '--', ...WORDS)
+    expect((await runNatter(sb, direct)).code).toBe(0)
+    expect(viaPane).toEqual(await readStubRun(sb))
+    expect(viaPane.argv.slice(-WORDS.length)).toEqual(WORDS)
+    expect(viaPane.argv).toContain('nats-channel:orchestrator')
+    expect(viaPane.argv).not.toContain('--here')
+  })
 
   const sentRuns = async () =>
     (await readHerdrCalls(sb)).filter((c) => c[1] === 'run')
@@ -507,6 +658,56 @@ describe('contract with the real claude-orchestrate', () => {
   )
 })
 
+describe('contract with the real claude-orchestrate, orchestrator', () => {
+  const real = Bun.which('claude-orchestrate')
+  ;(real ? test : test.skip)(
+    'runs the agent with no orchestration prompt and CLAUDE_ORCHESTRATE cleared',
+    async () => {
+      await mkdir(stateDir('x'), { recursive: true })
+      const dry = await dryHere(
+        orchestrator('--fleet', 'x', '--here', '--', '--resume'),
+      )
+      const proc = Bun.spawn(
+        [
+          'env',
+          ...dry.unset.flatMap((u) => ['-u', u]),
+          ...Object.entries(dry.set).map(([k, v]) => `${k}=${v}`),
+          real as string,
+          '-n',
+          ...dry.argv.slice(1),
+        ],
+        {
+          env: {
+            PATH: `${sb.bin}:${process.env.PATH}`,
+            HOME: sb.home,
+            XDG_STATE_HOME: sb.state,
+            XDG_CONFIG_HOME: join(sb.home, '.config'),
+            CLAUDE_ORCHESTRATE: '1',
+          },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        },
+      )
+      const out = await new Response(proc.stdout).text()
+      expect(await proc.exited).toBe(0)
+      const l = parseEnvCommand(
+        splitLine(out.trim().split('\n').at(-1) as string),
+      )
+      expect(l.set).toHaveProperty('CLAUDE_ORCHESTRATE', '')
+      expect(l.argv[0]).toBe('claude')
+      const at = l.argv.indexOf('--agent')
+      expect(l.argv[at + 1]).toBe('nats-channel:orchestrator')
+      expect(l.argv).not.toContain('--append-system-prompt-file')
+      expect(l.argv.slice(l.argv.indexOf(CHANNEL[0] as string))).toEqual([
+        ...CHANNEL,
+        '--settings',
+        ORCHESTRATOR_SETTINGS,
+        '--resume',
+      ])
+    },
+  )
+})
+
 describe('names agree with the session', () => {
   // `args` starts with the role, which the launcher takes first.
   const dry = async ([role, ...rest]: string[]) =>
@@ -596,20 +797,29 @@ describe('errors', () => {
     await fails(['-n', ...worker('--fleet', 'x', '--here', repo)], { path })
   })
 
-  test('herdr missing, outside a pane, says to use --here', async () => {
+  test('herdr missing, outside a pane, fails and sends nothing', async () => {
     const path = await isolatedPath(sb, 'claude-orchestrate')
     const ran = await runNatter(sb, ['-n', ...worker('--fleet', 'x', repo)], {
       path,
     })
     expect(ran.code).not.toBe(0)
-    expect(ran.stderr).toContain('--here')
+    expect(ran.stdout).toBe('')
   })
 
   test('a dry run creates no directory', async () => {
-    await runNatter(sb, ['-n', ...worker('--fleet', 'x', '--here', repo)])
-    await runNatter(sb, ['-n', 'orchestrator', '--fleet', 'x'])
-    await runNatter(sb, ['-n', ...worker('--fleet', 'x', repo)])
-    expect(await readdir(sb.state)).toEqual([])
-    expect(await readdir(sb.home)).toEqual([])
+    const home = join(sb.root, 'fresh-home')
+    const state = join(sb.root, 'fresh-state')
+    await Promise.all([mkdir(home), mkdir(state)])
+    const env = { HOME: home, XDG_STATE_HOME: state }
+    await runNatter(sb, ['-n', ...worker('--fleet', 'x', '--here', repo)], {
+      env,
+    })
+    await runNatter(sb, ['-n', 'orchestrator', '--fleet', 'x'], { env })
+    await runNatter(sb, ['-n', 'orchestrator', '--fleet', 'x', '--here'], {
+      env,
+    })
+    await runNatter(sb, ['-n', ...worker('--fleet', 'x', repo)], { env })
+    expect(await readdir(state)).toEqual([])
+    expect(await readdir(home)).toEqual([])
   })
 })

@@ -82,16 +82,19 @@ fi
 [[ $fleet =~ $FLEET_PATTERN ]] || die "fleet must match $FLEET_PATTERN: $fleet"
 if [[ $role == orchestrator ]]; then
   [[ -z $name ]] || die "an orchestrator is always named orchestrator"
-  # S7: remove this guard and add the per-fleet state directory, NATTER_PROVISION,
-  # -a nats-channel:orchestrator and --settings. Until then this would launch a full-power session.
   name=orchestrator
-  die "orchestrator is not ready yet: it needs the read-only agent and its settings"
 elif [[ -n $name ]]; then
   [[ $name =~ $NAME_PATTERN ]] || die "name must match $NAME_PATTERN: $name"
   [[ $name != admin && $name != orchestrator ]] || die "name is reserved, not for a worker: $name"
 fi
 ((! here || ! force_workspace)) || die "--here and -w exclude each other"
-dir=$(cd "$dir" && pwd)
+if [[ $role == orchestrator ]]; then
+  # An empty directory per fleet, so the read-only session has no project to read.
+  dir=${XDG_STATE_HOME:-$HOME/.local/state}/natter/orchestrator/$fleet
+  ((dry)) || mkdir -p "$dir" || die "cannot create $dir"
+else
+  dir=$(cd "$dir" && pwd)
+fi
 
 command -v claude-orchestrate >/dev/null || die "claude-orchestrate not found"
 
@@ -107,8 +110,10 @@ launch_here() {
   [[ $role == orchestrator || -n $name ]] || cmd+=(-u NATTER_NAME)
   cmd+=("NATTER_ROLE=$role" "NATTER_FLEET=$fleet")
   [[ -z $name ]] || cmd+=("NATTER_NAME=$name")
-  cmd+=(claude-orchestrate --no-herdr "$dir" -- "${CHANNEL_FLAG[@]}")
-  [[ $role != worker ]] || cmd+=(--settings "$root/config/worker.settings.json")
+  [[ $role != orchestrator ]] || cmd+=(NATTER_PROVISION=1)
+  cmd+=(claude-orchestrate --no-herdr)
+  [[ $role != orchestrator ]] || cmd+=(-a nats-channel:orchestrator)
+  cmd+=("$dir" -- "${CHANNEL_FLAG[@]}" --settings "$root/config/$role.settings.json")
   cmd+=("$@")
   if ((dry)); then run "${cmd[@]}"; exit 0; fi
   echo "natter: starting $role in fleet $fleet" >&2
