@@ -7,7 +7,8 @@ import { createUser } from '@nats-io/nkeys'
 import { connect, type NatsConnection } from '@nats-io/transport-node'
 import { deleteStreams, streamsFor } from '../src/bootstrap'
 import { bootstrapStreams } from './support/fleet'
-import { startNats, type TestNats } from './support/nats'
+import { startNats, type TestNats, until } from './support/nats'
+import { callTool, type Session, startSession } from './support/session'
 
 // A Bun test timeout kills tracked subprocesses, including a shared nats-server.
 setDefaultTimeout(15_000)
@@ -165,4 +166,85 @@ test('NATTER_FLEET points the stream and consumer checks at that fleet', async (
   } finally {
     await deleteStreams(jsm, fleet)
   }
+})
+
+// ------------------------------------------------------------ the tool
+
+const sessions: Session[] = []
+afterAll(async () => {
+  await Promise.all(sessions.map((s) => s.close()))
+})
+
+/** A session with no NATTER_URL, so only the settings in `env` can name the server. */
+const session = async (env: Record<string, string>) => {
+  const s = await startSession({
+    NATTER_FLEET: 'default',
+    NATTER_CREDS_DIR: credsDir,
+    ...env,
+  })
+  sessions.push(s)
+  return s
+}
+const roles = {
+  orchestrator: { NATTER_ROLE: 'orchestrator', NATTER_NAME: 'orchestrator' },
+  worker: { NATTER_ROLE: 'worker', NATTER_NAME: 'doctor-tool' },
+}
+
+test.each(Object.entries(roles))(
+  'the doctor tool of a %s returns the checks',
+  async (_, role) => {
+    const s = await session({ ...role, NATTER_UC_URL: nats.url })
+    const reply = await callTool(s, 'doctor')
+    const text = reply.content[0]?.text ?? ''
+
+    expect(text).toMatch(/^PASS config:.*default/m)
+    expect(text).toMatch(/^PASS stream NATTER_DEFAULT_TASKS:/m)
+    expect(text).not.toContain(seedText)
+  },
+)
+
+test('the doctor tool reads the plugin settings when no NATTER_URL is set', async () => {
+  const s = await session({ ...roles.orchestrator, NATTER_UC_URL: nats.url })
+  const text = (await callTool(s, 'doctor')).content[0]?.text ?? ''
+
+  expect(text).toContain(`PASS tcp: ${nats.url.replace('nats://', '')}`)
+  expect(text).not.toMatch(/^FAIL tcp:/m)
+})
+
+test('the doctor tool opens its own connection and closes it', async () => {
+  const s = await session({ ...roles.worker, NATTER_UC_URL: nats.url })
+  await until(async () => (await nats.clientNames()).length >= 2)
+  const open = (await nats.clientNames()).length
+  const total = await nats.totalConnections()
+  await callTool(s, 'doctor')
+
+  expect(await nats.totalConnections()).toBeGreaterThan(total)
+  await until(async () => (await nats.clientNames()).length === open)
+})
+
+test('the doctor tool returns FAIL lines promptly when NATS is down', async () => {
+  const down = await startNats({ autostart: false })
+  try {
+    const s = await session({ ...roles.orchestrator, NATTER_UC_URL: down.url })
+    const started = Date.now()
+    const reply = await callTool(s, 'doctor')
+    const text = reply.content[0]?.text ?? ''
+
+    expect(reply.isError).toBeFalsy()
+    expect(text).toMatch(/^FAIL tcp:/m)
+    expect(Date.now() - started).toBeLessThan(8000)
+  } finally {
+    await down.cleanup()
+  }
+})
+
+test('a URL the checks cannot parse is a FAIL line, not a tool error', async () => {
+  const s = await session({
+    ...roles.orchestrator,
+    NATTER_UC_URL: 'nats://[127.0.0.1]:4222',
+  })
+  const reply = await callTool(s, 'doctor')
+
+  expect(reply.isError).toBeFalsy()
+  expect(reply.content[0]?.text).toMatch(/^FAIL /m)
 })

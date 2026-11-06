@@ -2,24 +2,28 @@ import { existsSync, statSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { type JetStreamManager, jetstreamManager } from '@nats-io/jetstream'
 import { connect, type NatsConnection } from '@nats-io/transport-node'
+import { z } from 'zod'
 import { diff, streamsFor } from './bootstrap'
 import {
   adminConfig,
   bootstrapCommand,
   type Config,
+  type Env,
   resolveConfig,
   resolveTransport,
 } from './config'
 import { connectOptions } from './connection'
 import { fleetScope, RESULTS_DURABLE, workerDurable } from './protocol'
 
-// Standalone command, not imported by src/server.ts. It connects once and
-// never retries, which a session's silent retry cannot do, so each failure
+// Runs as a command and as the `doctor` tool of both roles. It connects once
+// and never retries, which a session's silent retry cannot do, so each failure
 // names its cause. It never prints seed content.
 
 const REACH_TIMEOUT_MS = 3000
 const CONNECT_TIMEOUT_MS = 5000
 const DEFAULT_PORT = 4222
+// Above the checks' own bounds, so it only stops a step that has none.
+const TOOL_TIMEOUT_MS = 20_000
 // The client's wording for a failed TLS handshake or certificate check.
 const TLS_FAILURE =
   /tls|ssl|certificate|self[- ]signed|unable to verify|handshake|secure connection/i
@@ -56,7 +60,7 @@ function reach(host: string, port: number): Promise<void> {
   })
 }
 
-async function run(env: NodeJS.ProcessEnv): Promise<Check[]> {
+export async function run(env: Env): Promise<Check[]> {
   const checks: Check[] = []
   let blocked = false
   /** Runs `fn` unless an earlier check failed; its return value is the detail of a pass. */
@@ -207,10 +211,57 @@ async function run(env: NodeJS.ProcessEnv): Promise<Check[]> {
   return checks
 }
 
+const formatChecks = (checks: Check[]) =>
+  checks
+    .map(
+      ({ name, status, detail }) =>
+        `${status.toUpperCase().padEnd(4)} ${name}: ${detail}`,
+    )
+    .join('\n')
+
+export const DOCTOR_TOOL = {
+  name: 'doctor',
+  description:
+    "Checks NATS connection, auth, streams and consumer on a fresh connection with this session's settings, and returns one PASS, FAIL or SKIP line per check. A failed check is in the text, not an error: report each FAIL with its reason. Opens one extra connection and closes it. Call it yourself, not through a subagent.",
+  inputSchema: z.toJSONSchema(z.object({})),
+}
+
+/** The tool's reply: the CLI's lines, bounded so a hung server cannot hold it. */
+export async function doctorReply(env: Env) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timedOut = new Promise<Check[]>((resolve) => {
+    timer = setTimeout(
+      () =>
+        resolve([
+          {
+            name: 'doctor',
+            status: 'fail',
+            detail: `no result in ${TOOL_TIMEOUT_MS}ms`,
+          },
+        ]),
+      TOOL_TIMEOUT_MS,
+    )
+  })
+  try {
+    // A bad address throws from `run`: it is a failed check, not a tool error.
+    const checks = await Promise.race([
+      run(env).catch((err): Check[] => [
+        {
+          name: 'doctor',
+          status: 'fail',
+          detail: err instanceof Error ? err.message : String(err),
+        },
+      ]),
+      timedOut,
+    ])
+    return { content: [{ type: 'text' as const, text: formatChecks(checks) }] }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 if (import.meta.main) {
   const checks = await run(process.env)
-  for (const { name, status, detail } of checks) {
-    console.log(`${status.toUpperCase().padEnd(4)} ${name}: ${detail}`)
-  }
+  console.log(formatChecks(checks))
   process.exit(checks.some((c) => c.status === 'fail') ? 1 : 0)
 }

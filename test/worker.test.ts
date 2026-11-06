@@ -1279,6 +1279,7 @@ test('sessions outside the worker role have no worker tools', async () => {
 
   const { tools } = await worker.client.listTools()
   expect(tools.map((t) => t.name).sort()).toEqual([
+    'doctor',
     'finish_task',
     'update_task',
   ])

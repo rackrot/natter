@@ -5,7 +5,8 @@
       "mcp__plugin_nats-channel_nats-channel__list_workers",
       "mcp__plugin_nats-channel_nats-channel__list_tasks",
       "mcp__plugin_nats-channel_nats-channel__status_page",
-      "mcp__plugin_nats-channel_nats-channel__get_result"
+      "mcp__plugin_nats-channel_nats-channel__get_result",
+      "mcp__plugin_nats-channel_nats-channel__doctor"
     ],
     "deny": [
       "Bash",

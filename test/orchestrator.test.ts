@@ -514,13 +514,14 @@ test('only the orchestrator role has the orchestrator tools', async () => {
   const names = async (s: Session) =>
     (await s.client.listTools()).tools.map((t) => t.name).sort()
   expect(await names(orchestrator)).toEqual([
+    'doctor',
     'get_result',
     'list_tasks',
     'list_workers',
     'send_task',
     'status_page',
   ])
-  expect(await names(worker)).toEqual(['finish_task', 'update_task'])
+  expect(await names(worker)).toEqual(['doctor', 'finish_task', 'update_task'])
   expect(await names(inert)).toEqual([])
   await expect(callTool(orchestrator, 'finish_task')).rejects.toThrow()
 })

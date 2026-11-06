@@ -23,6 +23,7 @@ import {
   resolveTimers,
 } from './config'
 import type { Connection } from './connection'
+import { DOCTOR_TOOL, doctorReply } from './doctor'
 import { clearHeld, writeHeld } from './held'
 import { type PresenceStatus, presenceEncoder } from './presence'
 import {
@@ -83,6 +84,7 @@ export const WORKER_TOOLS = [
       }),
     ),
   },
+  DOCTOR_TOOL,
 ]
 
 interface InFlight {
@@ -928,6 +930,7 @@ export function createWorker({
     },
 
     async callTool(name, args) {
+      if (name === DOCTOR_TOOL.name) return doctorReply(env)
       if (name !== 'update_task' && name !== 'finish_task') {
         return toolError('unknown tool')
       }
