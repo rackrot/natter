@@ -1,6 +1,7 @@
 [tools]
 bun = "1.4.4"
 biome = "2.5.15"
+shellcheck = "0.11.0"
 nats-server = "2.15.2"
 "aqua:nats-io/natscli" = "0.5.1"
 
@@ -38,8 +39,8 @@ exec nats "${args[@]}" sub "natter.${NATTER_FLEET:+$NATTER_FLEET.}>"
 '''
 
 [tasks.lint]
-description = "Biome check and type check"
-run = ["biome check .", "bunx tsc --noEmit"]
+description = "Biome check, type check and shellcheck"
+run = ["biome check .", "bunx tsc --noEmit", "shellcheck bin/natter"]
 
 [tasks.fmt]
 description = "Format with Biome"

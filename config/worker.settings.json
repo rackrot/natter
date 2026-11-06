@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_nats-channel_nats-channel__update_task",
+      "mcp__plugin_nats-channel_nats-channel__finish_task"
+    ]
+  }
+}

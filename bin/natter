@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# natter: start a natter session (a worker or an orchestrator) in a fleet. It wraps
+# claude-orchestrate and keeps no copy of its prompt, shell or env handling. One path launches
+# claude: `--here` (or a herdr pane) sets NATTER_* on an exec of `claude-orchestrate --no-herdr`.
+# Anywhere else a new herdr workspace runs `natter ... --here` in its pane, so both are one path.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF2'
+Usage:
+  natter orchestrator --fleet F [OPTIONS] [-- CLAUDE_ARGS...]
+  natter worker --fleet F [--name N] [OPTIONS] [DIR] [-- CLAUDE_ARGS...]
+
+  --fleet F    the fleet to join (default: $NATTER_FLEET); lowercase letters, digits and
+               hyphens, at most 32, starting with a letter or digit
+  --name N     worker name (default: .claude/natter.json, else the directory name)
+  -w           open a new herdr workspace even inside a herdr pane
+  --here       run in this terminal, whatever herdr says
+  -d           do not attach to the new workspace
+  -n           print the commands instead of running them
+  -h           show this help
+
+Inside a herdr pane (HERDR_ENV=1) the session runs in that pane. Elsewhere it opens a herdr
+workspace and attaches. Arguments after `--` go to claude.
+EOF2
+}
+
+die() { echo "natter: $*" >&2; exit 1; }
+
+# Held together with FLEET_PATTERN, NAME_PATTERN and isReserved in src/config.ts by a test.
+FLEET_PATTERN='^[a-z0-9][a-z0-9-]{0,31}$'
+NAME_PATTERN='^[a-z0-9][a-z0-9_-]{0,63}$'
+CHANNEL_FLAG=(--dangerously-load-development-channels plugin:nats-channel@natter)
+# The only settings a pane gets, and only when set: the pane does not inherit this shell.
+CONNECTION_VARS=(NATTER_URL NATTER_CREDS_DIR NATTER_CA_FILE NATTER_ALLOW_PLAINTEXT)
+
+self=$(readlink -f "${BASH_SOURCE[0]}")
+root=$(dirname "$(dirname "$self")")
+
+(($#)) || { usage >&2; exit 2; }
+case $1 in
+  -h|--help) usage; exit 0 ;;
+  orchestrator|worker) role=$1; shift ;;
+  *) die "expected orchestrator or worker, got: $1" ;;
+esac
+
+fleet=${NATTER_FLEET:-}
+name=
+force_workspace=0
+here=0
+dashdash=0
+attach=1
+dry=0
+while (($#)); do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    --fleet) (($# > 1)) || die "--fleet needs a name"; fleet=$2; shift 2 ;;
+    --name) (($# > 1)) || die "--name needs a name"; name=$2; shift 2 ;;
+    -w) force_workspace=1; shift ;;
+    --here) here=1; shift ;;
+    -d) attach=0; shift ;;
+    -n) dry=1; shift ;;
+    --) dashdash=1; shift; break ;;
+    -*) die "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+
+# After `--` everything is for claude, so a DIR is only read before it.
+dir=$PWD
+if ((! dashdash)); then
+  if (($#)); then
+    [[ $role == worker ]] || die "an orchestrator takes no directory: $1"
+    [[ -d $1 ]] || die "no such directory: $1"
+    dir=$1
+    shift
+  fi
+  [[ ${1:-} != -- ]] || shift
+fi
+
+[[ -n $fleet ]] || die "no fleet: pass --fleet or export NATTER_FLEET"
+[[ $fleet =~ $FLEET_PATTERN ]] || die "fleet must match $FLEET_PATTERN: $fleet"
+if [[ $role == orchestrator ]]; then
+  [[ -z $name ]] || die "an orchestrator is always named orchestrator"
+  # S7: remove this guard and add the per-fleet state directory, NATTER_PROVISION,
+  # -a nats-channel:orchestrator and --settings. Until then this would launch a full-power session.
+  name=orchestrator
+  die "orchestrator is not ready yet: it needs the read-only agent and its settings"
+elif [[ -n $name ]]; then
+  [[ $name =~ $NAME_PATTERN ]] || die "name must match $NAME_PATTERN: $name"
+  [[ $name != admin && $name != orchestrator ]] || die "name is reserved, not for a worker: $name"
+fi
+((! here || ! force_workspace)) || die "--here and -w exclude each other"
+dir=$(cd "$dir" && pwd)
+
+command -v claude-orchestrate >/dev/null || die "claude-orchestrate not found"
+
+run() {
+  if ((dry)); then printf '%q ' "$@"; echo; return; fi
+  "$@"
+}
+
+# The one path that launches claude. NATTER_ROLE is set here and nowhere else, so a shell left
+# in a pane afterwards never starts a session by accident.
+launch_here() {
+  local cmd=(env -u CLAUDE_ORCHESTRATE_AGENT)
+  [[ $role == orchestrator || -n $name ]] || cmd+=(-u NATTER_NAME)
+  cmd+=("NATTER_ROLE=$role" "NATTER_FLEET=$fleet")
+  [[ -z $name ]] || cmd+=("NATTER_NAME=$name")
+  cmd+=(claude-orchestrate --no-herdr "$dir" -- "${CHANNEL_FLAG[@]}")
+  [[ $role != worker ]] || cmd+=(--settings "$root/config/worker.settings.json")
+  cmd+=("$@")
+  if ((dry)); then run "${cmd[@]}"; exit 0; fi
+  echo "natter: starting $role in fleet $fleet" >&2
+  exec "${cmd[@]}"
+}
+
+if ((here)) || { [[ ${HERDR_ENV:-} == 1 ]] && ((! force_workspace)); }; then
+  launch_here "$@"
+fi
+
+command -v herdr >/dev/null || die "herdr not found; use --here to run in this terminal"
+command -v jq >/dev/null || die "jq not found"
+inside=0
+[[ ${HERDR_ENV:-} != 1 ]] || inside=1
+
+create=(workspace create --cwd "$dir" --label "$fleet:${name:-$(basename "$dir")}" --focus)
+for var in "${CONNECTION_VARS[@]}"; do
+  [[ -z ${!var:-} ]] || create+=(--env "$var=${!var}")
+done
+# --here comes before DIR: the option loop stops at DIR, so a later --here would reach claude.
+pane_cmd=("$self" "$role" --fleet "$fleet")
+[[ $role == orchestrator || -z $name ]] || pane_cmd+=(--name "$name")
+pane_cmd+=(--here)
+[[ $role == orchestrator ]] || pane_cmd+=("$dir")
+pane_cmd+=(-- "$@")
+# The line is typed at the pane's shell prompt. Bash %q leaves a leading = bare, which zsh
+# expands as a command path, so that one is escaped too.
+pane_line=
+for word in "${pane_cmd[@]}"; do
+  quoted=$(printf '%q' "$word")
+  [[ $quoted != =* ]] || quoted=\\$quoted
+  pane_line+="$quoted "
+done
+
+if ((dry)); then
+  ((inside)) || run herdr server
+  run herdr "${create[@]}"
+  run herdr pane wait-output --regex '\S' --timeout 10000 '<new pane>'
+  run herdr pane run '<new pane>' "$pane_line"
+  run herdr pane wait-output --match 'natter: starting' --timeout 15000 '<new pane>'
+  ((inside || ! attach)) || run herdr
+  exit 0
+fi
+
+# Copied from claude-orchestrate: start the herdr server when it is not running.
+# The output is captured first: `| grep -q` under pipefail can fail with SIGPIPE.
+server_running() {
+  local status
+  status=$(herdr status server 2>/dev/null || true)
+  [[ $status == *'status: running'* ]]
+}
+if ! server_running; then
+  setsid herdr server </dev/null >/dev/null 2>&1 &
+  for _ in $(seq 50); do
+    server_running && break
+    sleep 0.1
+  done
+  server_running || die "herdr server did not start"
+fi
+
+reply=$(herdr "${create[@]}") || die "herdr workspace create failed"
+pane=$(jq -r '.result.root_pane.pane_id // .result.pane.pane_id // empty' <<<"$reply" 2>/dev/null || true)
+if [[ -z $pane ]]; then
+  workspace=$(jq -r '.result.workspace.workspace_id // empty' <<<"$reply" 2>/dev/null || true)
+  die "herdr returned no pane (workspace ${workspace:-unknown}, close it yourself): $reply"
+fi
+
+# A command typed before the shell prints anything can be mangled, so wait for first output. It is
+# sent once: a second send could land in Claude's prompt.
+herdr pane wait-output --regex '\S' --timeout 10000 "$pane" >/dev/null ||
+  die "pane $pane showed no output; nothing was sent. In it, run: $pane_line"
+herdr pane run "$pane" "$pane_line" >/dev/null ||
+  die "herdr pane run failed in pane $pane. In it, run: $pane_line"
+herdr pane wait-output --match 'natter: starting' --timeout 15000 "$pane" >/dev/null ||
+  echo "natter: no start line from pane $pane; if its prompt is idle, run: $pane_line" >&2
+
+((inside || ! attach)) || exec herdr
