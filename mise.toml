@@ -16,12 +16,16 @@ run = "nats-server -js -a 127.0.0.1 -sd .nats-data"
 description = "Create or reconcile the NATTER_* JetStream streams (admin)"
 run = "bun src/bootstrap.ts"
 
+[tasks.fleet-delete]
+description = "Delete the five streams of NATTER_FLEET and all they hold (admin)"
+run = "bun src/bootstrap.ts delete"
+
 [tasks.doctor]
 description = "Check the config, transport, auth, JetStream, streams and consumer of this session"
 run = "bun src/doctor.ts"
 
 [tasks.monitor]
-description = "Tail natter.> with the nats CLI (development only; payloads are untrusted)"
+description = "Tail NATTER_FLEET, or every fleet when unset, with the nats CLI (development only; payloads are untrusted)"
 shell = "bash -c"
 run = '''
 creds="${NATTER_CREDS_DIR:-${NATTER_UC_CREDS_DIR:-$HOME/.config/natter}}"
@@ -30,7 +34,7 @@ args=(--server "${NATTER_URL:-${NATTER_UC_URL:-nats://127.0.0.1:4222}}")
 [ -s "$creds/natter.nk" ] && args+=(--nkey "$creds/natter.nk")
 ca="${NATTER_CA_FILE:-$NATTER_UC_CA_FILE}"
 [ -n "$ca" ] && args+=(--tlsca "$ca")
-exec nats "${args[@]}" sub "natter.>"
+exec nats "${args[@]}" sub "natter.${NATTER_FLEET:+$NATTER_FLEET.}>"
 '''
 
 [tasks.lint]

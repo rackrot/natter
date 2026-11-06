@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -53,6 +53,8 @@ export async function startNats(
     tls?: { certFile: string; keyFile: string }
     /** A nats-server config file; the flags below still set address, ports and store. */
     configFile?: string
+    /** A size such as `512MiB`, for JetStream with a storage limit. */
+    maxFileStore?: string
   } = {},
 ): Promise<TestNats> {
   const [port, monitorPort] = freePorts()
@@ -74,6 +76,14 @@ export async function startNats(
   // A config file sets its own store and JetStream.
   if (opts.configFile) args.push('-c', opts.configFile)
   else args.push('-sd', storeDir)
+  if (opts.maxFileStore) {
+    const conf = join(storeDir, 'limits.conf')
+    await writeFile(
+      conf,
+      `jetstream { max_file_store: ${opts.maxFileStore} }\n`,
+    )
+    args.push('-c', conf)
+  }
   if (opts.jetstream && !opts.configFile) args.push('-js')
   if (opts.tls) {
     args.push('--tls', '--tlscert', opts.tls.certFile)

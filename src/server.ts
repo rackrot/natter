@@ -18,7 +18,7 @@ const resolved = resolveConfig(process.env)
 const config = 'config' in resolved ? resolved.config : undefined
 log(
   'config' in resolved
-    ? `role=${resolved.config.role} name=${resolved.config.name}`
+    ? `role=${resolved.config.role} name=${resolved.config.name} fleet=${resolved.config.fleet}`
     : `inactive: ${resolved.inert}`,
 )
 

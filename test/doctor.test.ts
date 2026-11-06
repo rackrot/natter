@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { type JetStreamManager, jetstreamManager } from '@nats-io/jetstream'
 import { createUser } from '@nats-io/nkeys'
 import { connect, type NatsConnection } from '@nats-io/transport-node'
+import { deleteStreams, streamsFor } from '../src/bootstrap'
 import { bootstrapStreams } from './support/fleet'
 import { startNats, type TestNats } from './support/nats'
 
@@ -127,4 +128,41 @@ test('a worker with no consumer yet fails that check only', async () => {
   expect(code).toBe(1)
   expect(out).toMatch(/^FAIL consumer task-doctor-test:/m)
   expect(out.match(/^FAIL/gm)).toHaveLength(1)
+})
+
+test.each([
+  ['no role', {}],
+  ['a worker', { NATTER_ROLE: 'worker', NATTER_NAME: 'doctor-test' }],
+])('an invalid NATTER_FLEET with %s fails the config line', async (_, env) => {
+  const { out, code } = await doctor(nats.url, {
+    ...env,
+    NATTER_FLEET: 'Bad_Fleet',
+  })
+
+  expect(code).toBe(1)
+  expect(out).toMatch(/^FAIL config:/m)
+})
+
+test('NATTER_FLEET points the stream and consumer checks at that fleet', async () => {
+  const fleet = streamsFor('doc-x')
+  const env = {
+    NATTER_FLEET: 'doc-x',
+    NATTER_ROLE: 'orchestrator',
+    NATTER_NAME: 'orchestrator',
+  }
+  try {
+    const missing = await doctor(nats.url, env)
+    expect(missing.code).toBe(1)
+    expect(missing.out).toMatch(/^PASS config:.*doc-x/m)
+    expect(missing.out).toMatch(/^FAIL stream NATTER_DOC-X_TASKS:/m)
+    expect(missing.out).not.toContain('NATTER_DEFAULT')
+
+    await bootstrapStreams(jsm, fleet)
+    const { out, code } = await doctor(nats.url, env)
+    expect(code).toBe(1)
+    expect(out).toMatch(/^PASS stream NATTER_DOC-X_SENT:/m)
+    expect(out).toMatch(/^FAIL consumer results:.*NATTER_DOC-X_RESULTS/m)
+  } finally {
+    await deleteStreams(jsm, fleet)
+  }
 })

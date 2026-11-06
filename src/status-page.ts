@@ -16,7 +16,7 @@ const HEADERS = {
 const page = (token: string) => `<!doctype html>
 <meta charset="utf-8">
 <title>natter status</title>
-<h1>natter</h1>
+<h1>natter <span id="fleet"></span></h1>
 <p id="error" hidden></p>
 <p id="note" hidden></p>
 <h2>Workers</h2>
@@ -43,6 +43,7 @@ function fill(id, header, rows) {
 }
 
 function show(data) {
+  document.getElementById('fleet').textContent = data.fleet
   const note = document.getElementById('note')
   note.hidden = !(data.tasks.truncated || data.workers.truncated)
   note.textContent = 'Some older rows are left out, so the counts here are not complete.'

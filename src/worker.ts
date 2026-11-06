@@ -16,7 +16,12 @@ import {
   RequestError,
 } from '@nats-io/transport-node'
 import { z } from 'zod'
-import { type Config, type Env, resolveTimers } from './config'
+import {
+  bootstrapCommand,
+  type Config,
+  type Env,
+  resolveTimers,
+} from './config'
 import type { Connection } from './connection'
 import { clearHeld, writeHeld } from './held'
 import { type PresenceStatus, presenceEncoder } from './presence'
@@ -177,7 +182,7 @@ export function createWorker({
     delay(ms, undefined, { signal: stopping.signal }).catch(() => {})
 
   const bootstrapHint = () =>
-    `${[...missingStreams].join(' and ')} missing: run mise run bootstrap`
+    `${[...missingStreams].join(' and ')} missing: run ${bootstrapCommand(config.fleet)}`
 
   const presenceBytes = presenceEncoder(config, env, instance, timers.heartbeat)
 

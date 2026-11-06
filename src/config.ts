@@ -66,6 +66,13 @@ export type Env = Record<string, string | undefined>
 // Empty counts as unset: unset `userConfig` values substitute as ''.
 const get = (env: Env, key: string) => env[key] || undefined
 
+/**
+ * The reconcile command for a fleet. Always named, `default` included: the bare
+ * form takes whatever `NATTER_FLEET` the shell has exported.
+ */
+export const bootstrapCommand = (fleet: string) =>
+  `NATTER_FLEET=${fleet} mise run bootstrap`
+
 // Reserved so a session cannot take the bootstrap identity's name or a
 // worker the orchestrator's.
 const isReserved = (role: Role, name: string) =>

@@ -183,6 +183,50 @@ describe('subjects', () => {
     },
   )
 
+  test.each(['task', 'result', 'status', 'presence', 'sent'])(
+    'a fleet named %p round-trips every subject',
+    (fleet) => {
+      const scope = fleetScope(fleet)
+      for (const worker of ['w1', 'task', 'sent']) {
+        expect(parseSubject(scope.taskSubject(worker))).toEqual({
+          kind: 'task',
+          worker,
+        })
+        expect(parseSubject(scope.presenceSubject(worker))).toEqual({
+          kind: 'presence',
+          worker,
+        })
+        expect(parseSubject(scope.resultSubject(worker, ID))).toEqual({
+          kind: 'result',
+          worker,
+          taskId: ID,
+        })
+        expect(parseSubject(scope.statusSubject(worker, ID))).toEqual({
+          kind: 'status',
+          worker,
+          taskId: ID,
+        })
+      }
+      expect(parseSubject(scope.sentSubject(ID))).toEqual({
+        kind: 'sent',
+        taskId: ID,
+      })
+    },
+  )
+
+  test.each([
+    'natter.task.w1',
+    'natter.presence.w1',
+    `natter.result.w1.${ID}`,
+    `natter.status.w1.${ID}`,
+    `natter.sent.${ID}`,
+    `natter.result.task.${ID}`,
+    `natter.result.result.${ID}`,
+    `natter.status.presence.${ID}`,
+  ])('the legacy subject %p does not parse', (subject) => {
+    expect(parseSubject(subject)).toBeUndefined()
+  })
+
   test('a fleet scope names five streams and subjects of its own', () => {
     const x = fleetScope('my-fleet')
     expect(Object.values(x.streams).sort()).toEqual([

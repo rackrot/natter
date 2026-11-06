@@ -18,7 +18,9 @@ import {
   RequestError,
 } from '@nats-io/transport-node'
 import { z } from 'zod'
+import { provisionStreams, streamsFor } from './bootstrap'
 import {
+  bootstrapCommand,
   type Config,
   DEFAULT_MAX_ATTEMPTS,
   DEFAULT_QUEUE_TTL_S,
@@ -87,7 +89,8 @@ const NO_RESPONDERS = 503
 // window, because every try carries the same Nats-Msg-Id.
 const PUBLISH_TRIES = 3
 
-export const BOOTSTRAP_HINT = 'NATTER_* streams missing: run mise run bootstrap'
+export const bootstrapHint = (fleet: string) =>
+  `NATTER_${fleet.toUpperCase()}_* streams missing: run ${bootstrapCommand(fleet)}`
 
 export const NATS_UNAVAILABLE = 'NATS unavailable'
 
@@ -162,6 +165,7 @@ export interface TaskRow {
 
 /** What the status page polls: the tools' readers, plus stream usage. */
 export interface StatusSnapshot {
+  fleet: string
   workers: { workers: ReturnType<typeof workerRow>[]; truncated: boolean }
   tasks: { tasks: TaskRow[]; truncated: boolean }
   streams: { name: string; messages: number; bytes: number }[]
@@ -277,8 +281,6 @@ const isMissingStream = (err: unknown) =>
   isNoResponders(err) ||
   (err instanceof JetStreamApiError &&
     err.code === JetStreamApiCodes.StreamNotFound)
-const failure = (err: unknown) =>
-  isMissingStream(err) ? BOOTSTRAP_HINT : describeError(err)
 
 const resultFields = ({
   summary,
@@ -316,6 +318,7 @@ export function createOrchestrator({
   const scope = fleetScope(config.fleet)
   const timers = resolveTimers(env)
   const limits = resolveLimits(env)
+  const hint = bootstrapHint(config.fleet)
   const stopping = new AbortController()
   let loop: Promise<void> | undefined
   let sweeping: Promise<void> | undefined
@@ -343,9 +346,18 @@ export function createOrchestrator({
   // Where the last sweep stopped pushing, so a cut-off sweep moves on from there.
   let attentionCursor = ''
 
+  // Why this session could not create its fleet's streams, for every reply
+  // that finds one missing: the log never reaches Claude.
+  let provisionFailure: string | undefined
+
   // Resolves early, not rejects, on stop(): every caller rechecks the signal.
   const sleep = (ms: number) =>
     delay(ms, undefined, { signal: stopping.signal }).catch(() => {})
+
+  const missing = () =>
+    provisionFailure ? `${provisionFailure}; ${hint}` : hint
+  const failure = (err: unknown) =>
+    isMissingStream(err) ? missing() : describeError(err)
 
   const manager = (nc: NatsConnection) =>
     jetstreamManager(nc, { checkAPI: false })
@@ -627,7 +639,7 @@ export function createOrchestrator({
         }),
       ),
     ])
-    return { workers, tasks, streams }
+    return { fleet: config.fleet, workers, tasks, streams }
   }
 
   async function getResult(
@@ -1044,10 +1056,39 @@ export function createOrchestrator({
     }
   }
 
+  /**
+   * Plan 3.2, once at the first connection and never from the retry below: a
+   * session that kept checking would bring a fleet back after fleet-delete.
+   */
+  async function provision(): Promise<void> {
+    while (!stopping.signal.aborted) {
+      const { nc } = connection
+      if (!nc) {
+        if (connection.unavailable) return
+        await sleep(timers.connectPoll)
+        continue
+      }
+      try {
+        const set = await provisionStreams(
+          await manager(nc),
+          streamsFor(config.fleet),
+        )
+        if (set === 'created') log(`created the ${config.fleet} streams`)
+        if (set === 'partial') log(hint)
+      } catch (err) {
+        provisionFailure = `cannot create the ${config.fleet} streams: ${describeError(err)}`
+        log(missing())
+      }
+      return
+    }
+  }
+
   async function run(): Promise<void> {
     // Claude Code registers its channel handler after connecting, and a push
-    // before that is lost.
-    await sleep(timers.startupGrace)
+    // before that is lost. Tool calls can come sooner, so the streams do not wait.
+    const grace = sleep(timers.startupGrace)
+    if (env.NATTER_PROVISION === '1') await provision()
+    await grace
     let restartIn = timers.restartMin
     while (!stopping.signal.aborted) {
       const { nc } = connection
@@ -1062,7 +1103,7 @@ export function createOrchestrator({
         })
       } catch (err) {
         if (isMissingStream(err)) {
-          log(BOOTSTRAP_HINT)
+          log(missing())
           await sleep(timers.streamRetry)
           continue
         }

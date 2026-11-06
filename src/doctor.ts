@@ -5,6 +5,7 @@ import { connect, type NatsConnection } from '@nats-io/transport-node'
 import { diff, streamsFor } from './bootstrap'
 import {
   adminConfig,
+  bootstrapCommand,
   type Config,
   resolveConfig,
   resolveTransport,
@@ -86,7 +87,7 @@ async function run(env: NodeJS.ProcessEnv): Promise<Check[]> {
     checks.push({
       name: 'config',
       status: 'pass',
-      detail: `${config.role} ${config.name}`,
+      detail: `${config.role} ${config.name} in fleet ${config.fleet}`,
     })
   } else {
     try {
@@ -100,7 +101,7 @@ async function run(env: NodeJS.ProcessEnv): Promise<Check[]> {
       name: 'config',
       status: noRole ? 'pass' : 'fail',
       detail: noRole
-        ? 'no NATTER_ROLE; connection checks only'
+        ? `no NATTER_ROLE; connection checks only, fleet ${config.fleet}`
         : resolved.inert,
     })
     blocked = !noRole
@@ -170,17 +171,18 @@ async function run(env: NodeJS.ProcessEnv): Promise<Check[]> {
       const { streams } = await jsm.getAccountInfo()
       return `${streams} streams in the account`
     })
+    const reconcile = bootstrapCommand(config.fleet)
     for (const want of streamsFor(config.fleet)) {
       await check(`stream ${want.name}`, async () => {
         const info = await (jsm as JetStreamManager).streams
           .info(want.name)
           .catch(() => {
-            throw new Error('missing; run bootstrap')
+            throw new Error(`missing; run ${reconcile}`)
           })
         const drift = diff(want, info.config)
         if (drift.length) {
           throw new Error(
-            `differs from bootstrap in ${drift.join(', ')}; run bootstrap`,
+            `differs from bootstrap in ${drift.join(', ')}; run ${reconcile}`,
           )
         }
         return 'matches bootstrap'

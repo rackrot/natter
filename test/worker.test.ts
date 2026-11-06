@@ -1182,7 +1182,11 @@ test('a stream absent at start recovers after bootstrap, and is never created by
   const manager = await jetstreamManager(conn)
   try {
     const name = freshName()
-    const s = await startWorkerSession(name, {}, bare.url)
+    const s = await startWorkerSession(
+      name,
+      { NATTER_PROVISION: '1' },
+      bare.url,
+    )
     await until(async () =>
       (await bare.clientNames()).includes(`natter-${name}`),
     )

@@ -159,6 +159,7 @@ const reflect = async (body: Uint8Array, target: string) => {
 }
 
 interface Snapshot {
+  fleet: string
   workers: { workers: { name: string; state: string }[] }
   tasks: { tasks: { task_id: string; worker: string; state: string }[] }
   streams: { name: string; messages: number }[]
@@ -355,6 +356,7 @@ test('shows workers, task states including waiting_permission, queue depth and s
   }
 
   const data = await snapshot(url)
+  expect(data.fleet).toBe('default')
   expect(data.workers.workers.map((w) => w.name)).toContain(name)
   expect(taskOf(data, waiting)?.state).toBe('waiting_permission')
   expect(taskOf(data, queued)?.state).toBe('queued')

@@ -18,8 +18,9 @@ import {
   PRESENCE_MAX_BYTES,
 } from './protocol'
 
-// Admin-only: creates or reconciles the five streams (plan 3.3). Workers
-// never create streams. Standalone command, not imported by src/server.ts.
+// The stream definitions, and the admin command that creates or reconciles a
+// fleet's five streams or deletes them (plan 3.3). Sessions only reach this
+// file for `provisionStreams` and the definitions. Workers never create streams.
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const MIB = 1024 * 1024
@@ -165,6 +166,25 @@ export interface StreamOutcome {
   messages?: { before: number; after: number }
 }
 
+const isStreamNotFound = (err: unknown) =>
+  err instanceof JetStreamApiError &&
+  err.code === JetStreamApiCodes.StreamNotFound
+
+/** Each stream as it is now, undefined only if the server says it does not exist. */
+const lookup = (jsm: JetStreamManager, wanted: readonly ManagedStream[]) =>
+  Promise.all(
+    wanted.map((want) =>
+      jsm.streams.info(want.name).catch((err: unknown) => {
+        if (isStreamNotFound(err)) return undefined
+        throw err
+      }),
+    ),
+  )
+
+// A copy: the client writes keys onto the config `add` is given.
+const create = (jsm: JetStreamManager, want: ManagedStream) =>
+  withStreamName(want.name, () => jsm.streams.add({ ...want }))
+
 const same = (a: unknown, b: unknown) =>
   JSON.stringify(Array.isArray(a) ? [...a].sort() : a) ===
   JSON.stringify(Array.isArray(b) ? [...b].sort() : b)
@@ -184,21 +204,7 @@ export async function bootstrapStreams(
   jsm: JetStreamManager,
   wanted: readonly ManagedStream[],
 ): Promise<StreamOutcome[]> {
-  const found = await Promise.all(
-    wanted.map(async (want) => {
-      try {
-        return await jsm.streams.info(want.name)
-      } catch (err) {
-        if (
-          err instanceof JetStreamApiError &&
-          err.code === JetStreamApiCodes.StreamNotFound
-        ) {
-          return undefined
-        }
-        throw err
-      }
-    }),
-  )
+  const found = await lookup(jsm, wanted)
 
   const plan = wanted.map((want, i) => {
     const have = found[i]
@@ -219,8 +225,7 @@ export async function bootstrapStreams(
   const outcomes: StreamOutcome[] = []
   for (const { want, have, changed } of plan) {
     if (!have) {
-      // A copy: the client writes keys onto the config `add` is given.
-      await withStreamName(want.name, () => jsm.streams.add({ ...want }))
+      await create(jsm, want)
       outcomes.push({ name: want.name, action: 'created', changed: [] })
     } else if (changed.length > 0) {
       const { state } = await withStreamName(want.name, () =>
@@ -239,6 +244,47 @@ export async function bootstrapStreams(
   return outcomes
 }
 
+/**
+ * All a session may do to streams (plan 3.2): create the set when none of it
+ * exists. A partial set is left alone, because a lost SENT recreated beside live
+ * results gets every stored result terminated, and nothing is ever updated.
+ *
+ * A failure partway throws and deletes nothing: what it made is a partial set,
+ * for bootstrap to finish. Two creators can race: `add` with identical settings
+ * returns the existing stream untouched, and with other settings fails 10058.
+ */
+export async function provisionStreams(
+  jsm: JetStreamManager,
+  wanted: readonly ManagedStream[],
+): Promise<'created' | 'complete' | 'partial'> {
+  const present = (await lookup(jsm, wanted)).filter(Boolean).length
+  if (present === wanted.length) return 'complete'
+  if (present > 0) return 'partial'
+  for (const want of wanted) await create(jsm, want)
+  return 'created'
+}
+
+/**
+ * Deletes streams and everything in them. In order, so SENT outlives RESULTS if
+ * this stops partway, and a stream already gone lets a rerun finish the rest.
+ */
+export async function deleteStreams(
+  jsm: JetStreamManager,
+  wanted: readonly ManagedStream[],
+): Promise<{ name: string; deleted: boolean }[]> {
+  const outcomes = []
+  for (const { name } of wanted) {
+    const deleted = await withStreamName(name, () =>
+      jsm.streams.delete(name).catch((err: unknown) => {
+        if (isStreamNotFound(err)) return false
+        throw err
+      }),
+    )
+    outcomes.push({ name, deleted })
+  }
+  return outcomes
+}
+
 /** Server errors such as insufficient storage do not say which stream failed. */
 async function withStreamName<T>(
   name: string,
@@ -251,7 +297,12 @@ async function withStreamName<T>(
   }
 }
 
-async function main(): Promise<void> {
+async function main(deleting: boolean): Promise<void> {
+  // The raw variable: unset resolves to `default`, whose streams must not go
+  // because one was forgotten.
+  if (deleting && !process.env.NATTER_FLEET) {
+    throw new Error('NATTER_FLEET must name the fleet to delete')
+  }
   const config = adminConfig(process.env)
   const transport = resolveTransport(config)
   if ('refused' in transport) throw new Error(transport.refused)
@@ -264,11 +315,16 @@ async function main(): Promise<void> {
     maxReconnectAttempts: 0,
   })
   try {
-    const outcomes = await bootstrapStreams(
-      await jetstreamManager(nc),
-      streamsFor(config.fleet),
-    )
+    const jsm = await jetstreamManager(nc)
+    const wanted = streamsFor(config.fleet)
     console.log(`streams on ${transport.address}:`)
+    if (deleting) {
+      for (const { name, deleted } of await deleteStreams(jsm, wanted)) {
+        console.log(`  ${name}: ${deleted ? 'deleted' : 'already gone'}`)
+      }
+      return
+    }
+    const outcomes = await bootstrapStreams(jsm, wanted)
     for (const { name, action, changed, messages } of outcomes) {
       const settings = changed.length ? ` (${changed.join(', ')})` : ''
       const stored = messages
@@ -282,9 +338,10 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch((err: unknown) => {
+  const deleting = process.argv[2] === 'delete'
+  main(deleting).catch((err: unknown) => {
     console.error(
-      `bootstrap failed: ${err instanceof Error ? err.message : err}`,
+      `${deleting ? 'fleet-delete' : 'bootstrap'} failed: ${err instanceof Error ? err.message : err}`,
     )
     process.exit(1)
   })

@@ -13,13 +13,19 @@ import {
 } from '@nats-io/jetstream'
 import {
   connect,
+  errors,
   type NatsConnection,
   nanos,
   nuid,
 } from '@nats-io/transport-node'
-import { streamsFor } from '../src/bootstrap'
+import {
+  deleteStreams,
+  diff,
+  provisionStreams,
+  streamsFor,
+} from '../src/bootstrap'
 import { MAX_TIMEOUT_S } from '../src/config'
-import { MAX_MESSAGE_BYTES } from '../src/protocol'
+import { fleetScope, MAX_MESSAGE_BYTES } from '../src/protocol'
 import {
   bootstrapStreams,
   PRESENCE_STREAM,
@@ -555,7 +561,7 @@ test('a core publish cannot replace a recorded result', async () => {
   expect(await storedResult(subject)).toEqual({ seq, value: 'first' })
 })
 
-test('NATTER_FLEET=x creates five NATTER_X_* streams like the default fleet and leaves others alone', async () => {
+test('NATTER_FLEET=a-b creates five NATTER_A-B_* streams like the default fleet and leaves others alone', async () => {
   await onFreshServer(async (server, _conn, manager) => {
     const run = async (fleet: string) => {
       const proc = Bun.spawn(['bun', 'src/bootstrap.ts'], {
@@ -581,24 +587,24 @@ test('NATTER_FLEET=x creates five NATTER_X_* streams like the default fleet and 
     expect(await run('default')).toBe(0)
     const defaults = await names()
     expect(defaults).toHaveLength(5)
-    expect(await run('x')).toBe(0)
+    expect(await run('a-b')).toBe(0)
 
     expect(await names()).toEqual(
       [
         ...defaults,
         ...['TASKS', 'RESULTS', 'STATE', 'PRESENCE', 'SENT'].map(
-          (s) => `NATTER_X_${s}`,
+          (s) => `NATTER_A-B_${s}`,
         ),
       ].sort(),
     )
     for (const suffix of ['TASKS', 'RESULTS', 'STATE', 'PRESENCE', 'SENT']) {
-      const x = (await manager.streams.info(`NATTER_X_${suffix}`)).config
+      const x = (await manager.streams.info(`NATTER_A-B_${suffix}`)).config
       const d = (await manager.streams.info(`NATTER_DEFAULT_${suffix}`)).config
       expect(x.subjects).toEqual(
-        d.subjects.map((subject) => subject.replace('default', 'x')),
+        d.subjects.map((subject) => subject.replace('default', 'a-b')),
       )
       const keys = Object.keys(
-        owned(streamsFor('x').find((w) => w.name === x.name) ?? {}),
+        owned(streamsFor('a-b').find((w) => w.name === x.name) ?? {}),
       )
       for (const key of keys) {
         expect(x[key as keyof typeof x]).toEqual(d[key as keyof typeof d])
@@ -606,5 +612,181 @@ test('NATTER_FLEET=x creates five NATTER_X_* streams like the default fleet and 
     }
     expect(await run('Bad_Fleet')).not.toBe(0)
     expect(await names()).toHaveLength(10)
+  })
+})
+
+// ------------------------------------------------------- provisioning, retiring
+
+const FLEET_X = streamsFor('x')
+const X_NAMES = FLEET_X.map((stream) => stream.name).sort()
+
+const streamNames = async (manager: JetStreamManager) =>
+  ((await manager.streams.names().next()) as string[]).sort()
+
+test('provisioning creates all five once, to the definitions', async () => {
+  await onFreshServer(async (_server, _conn, manager) => {
+    expect(await provisionStreams(manager, FLEET_X)).toBe('created')
+
+    expect(await streamNames(manager)).toEqual(X_NAMES)
+    for (const want of FLEET_X) {
+      expect(
+        diff(want, (await manager.streams.info(want.name)).config),
+      ).toEqual([])
+    }
+    expect(await provisionStreams(manager, FLEET_X)).toBe('complete')
+  })
+})
+
+test('provisioning fills no partial set, whichever streams survive', async () => {
+  await onFreshServer(async (_server, _conn, manager) => {
+    for (const want of FLEET_X) {
+      await bootstrapStreams(manager, FLEET_X)
+      await manager.streams.delete(want.name)
+      expect(await provisionStreams(manager, FLEET_X)).toBe('partial')
+      expect(await streamNames(manager)).not.toContain(want.name)
+
+      await deleteStreams(manager, FLEET_X)
+      await manager.streams.add({ ...want })
+      expect(await provisionStreams(manager, FLEET_X)).toBe('partial')
+      expect(await streamNames(manager)).toEqual([want.name])
+      await manager.streams.delete(want.name)
+    }
+  })
+})
+
+test('provisioning leaves a drifted set as it is', async () => {
+  await onFreshServer(async (_server, _conn, manager) => {
+    await bootstrapStreams(manager, FLEET_X)
+    const name = 'NATTER_X_TASKS'
+    const { config } = await manager.streams.info(name)
+    await manager.streams.update(name, { ...config, max_msgs_per_subject: 5 })
+
+    expect(await provisionStreams(manager, FLEET_X)).toBe('complete')
+
+    expect((await manager.streams.info(name)).config.max_msgs_per_subject).toBe(
+      5,
+    )
+  })
+})
+
+test('a lookup that fails is not read as a missing stream', async () => {
+  const timeout = new errors.TimeoutError()
+  const added: unknown[] = []
+  const manager = {
+    streams: {
+      info: () => Promise.reject(timeout),
+      add: async (config: unknown) => {
+        added.push(config)
+      },
+    },
+  } as unknown as JetStreamManager
+
+  await expect(provisionStreams(manager, FLEET_X)).rejects.toBe(timeout)
+
+  expect(added).toEqual([])
+})
+
+test('creators racing on a bare server all finish, with one set', async () => {
+  await onFreshServer(async (_server, _conn, manager) => {
+    await Promise.all(
+      Array.from({ length: 4 }, () => provisionStreams(manager, FLEET_X)),
+    )
+
+    expect(await streamNames(manager)).toEqual(X_NAMES)
+  })
+})
+
+/** A creator whose check ran before another creator: it sees no streams. */
+const staleCheck = (manager: JetStreamManager) =>
+  ({
+    streams: {
+      info: (name: string) => manager.streams.info(`GONE_${name}`),
+      add: (config: Parameters<typeof manager.streams.add>[0]) =>
+        manager.streams.add(config),
+    },
+  }) as unknown as JetStreamManager
+
+test('a creator whose check went stale changes nothing the winner made', async () => {
+  await onFreshServer(async (_server, conn, manager) => {
+    await bootstrapStreams(manager, FLEET_X)
+    const stored = fleetScope('x').taskSubject('w1')
+    await jetstream(conn).publish(stored, 'queued')
+
+    expect(await provisionStreams(staleCheck(manager), FLEET_X)).toBe('created')
+    expect(await streamNames(manager)).toEqual(X_NAMES)
+    expect((await manager.streams.info('NATTER_X_TASKS')).state.messages).toBe(
+      1,
+    )
+
+    const name = 'NATTER_X_TASKS'
+    const { config } = await manager.streams.info(name)
+    await manager.streams.update(name, { ...config, max_msgs_per_subject: 5 })
+
+    await expect(
+      provisionStreams(staleCheck(manager), FLEET_X),
+    ).rejects.toThrow(name)
+    const after = await manager.streams.info(name)
+    expect(after.config.max_msgs_per_subject).toBe(5)
+    expect(after.state.messages).toBe(1)
+  })
+})
+
+test('a create past the storage limit names the stream and keeps the ones made', async () => {
+  const server = await startNats({ jetstream: true, maxFileStore: '512MiB' })
+  const conn = await connect({ servers: server.url })
+  try {
+    const manager = await jetstreamManager(conn)
+    const refused = await provisionStreams(manager, FLEET_X).catch(
+      (err: Error) => err.message,
+    )
+
+    expect(refused).toContain('NATTER_X_RESULTS')
+    expect(await streamNames(manager)).toEqual(['NATTER_X_TASKS'])
+  } finally {
+    await conn.close()
+    await server.cleanup()
+  }
+})
+
+const fleetDelete = (url: string, env: Record<string, string> = {}) =>
+  Bun.spawn(['bun', 'src/bootstrap.ts', 'delete'], {
+    env: {
+      PATH: process.env.PATH ?? '',
+      NATTER_URL: url,
+      NATTER_CREDS_DIR: join(tmpdir(), 'natter-no-creds'),
+      ...env,
+    },
+    stdout: 'ignore',
+    stderr: 'ignore',
+    timeout: 4000,
+  }).exited
+
+test('fleet-delete removes the five streams of one fleet, and a partial set too', async () => {
+  await onFreshServer(async (server, _conn, manager) => {
+    await bootstrapStreams(manager)
+    await bootstrapStreams(manager, FLEET_X)
+    await manager.streams.delete('NATTER_X_RESULTS')
+
+    expect(await fleetDelete(server.url, { NATTER_FLEET: 'x' })).toBe(0)
+
+    expect(await streamNames(manager)).toEqual(
+      STREAMS.map((stream) => stream.name).sort(),
+    )
+    expect(await fleetDelete(server.url, { NATTER_FLEET: 'x' })).toBe(0)
+  })
+})
+
+test.each([
+  ['unset', {}],
+  ['empty', { NATTER_FLEET: '' }],
+  ['invalid', { NATTER_FLEET: 'Bad_Fleet' }],
+])('fleet-delete with NATTER_FLEET %s deletes nothing', async (_, env) => {
+  await onFreshServer(async (server, _conn, manager) => {
+    await bootstrapStreams(manager)
+    const before = await streamNames(manager)
+
+    expect(await fleetDelete(server.url, env)).not.toBe(0)
+
+    expect(await streamNames(manager)).toEqual(before)
   })
 })

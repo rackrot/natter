@@ -24,10 +24,11 @@ import {
   nanos,
   nuid,
 } from '@nats-io/transport-node'
-import { resolveConfig } from '../src/config'
+import { deleteStreams, streamsFor } from '../src/bootstrap'
+import { DEFAULT_FLEET, resolveConfig } from '../src/config'
 import { startConnection } from '../src/connection'
 import {
-  BOOTSTRAP_HINT,
+  bootstrapHint,
   createOrchestrator,
   NATS_UNAVAILABLE,
 } from '../src/orchestrator'
@@ -44,6 +45,7 @@ import {
   resultSubject,
   sentSubject,
   statusSubject,
+  TASKS_STREAM,
   taskSubject,
 } from './support/fleet'
 import { startNats, type TestNats, until } from './support/nats'
@@ -63,6 +65,7 @@ const ACK_WAIT_MS = 500
 const BOUNDED_MS = 3000
 const GRACE_MS = 20
 const NO_CREDS = join(tmpdir(), 'natter-no-creds')
+const HINT = bootstrapHint(DEFAULT_FLEET)
 
 let nats: TestNats
 let nc: NatsConnection
@@ -759,7 +762,7 @@ test('no responders may follow a try that landed, so the reply names the task', 
 
     expect(reply.isError).toBe(true)
     expect(reply.content[0]?.text).toContain(await lastRecordId(manager))
-    expect(reply.content[0]?.text).toContain(BOOTSTRAP_HINT)
+    expect(reply.content[0]?.text).toContain(HINT)
   })
 })
 
@@ -1958,14 +1961,14 @@ test('a missing NATTER_DEFAULT_SENT holds results, stops sends, and recovers aft
       prompt: 'p',
     })
     expect(refused.isError).toBe(true)
-    expect(refused.content[0]?.text).toContain(BOOTSTRAP_HINT)
+    expect(refused.content[0]?.text).toContain(HINT)
     expect(await queued(worker, manager)).toBe(1)
     for (const reply of [
       await callTool(s, 'list_tasks'),
       await callTool(s, 'get_result', { task_id }),
     ]) {
       expect(reply.isError).toBe(true)
-      expect(reply.content[0]?.text).toContain(BOOTSTRAP_HINT)
+      expect(reply.content[0]?.text).toContain(HINT)
     }
 
     await bootstrapStreams(manager)
@@ -2000,6 +2003,255 @@ test('missing streams are reported, then recovered from after bootstrap', async 
       expect(await queued(worker, manager)).toBe(1)
       await storeResult(worker, task_id, {}, js)
       expect((await pushCount(s, 1))?.meta.task_id).toBe(task_id)
+    },
+    { bootstrap: false },
+  )
+})
+
+// ------------------------------------------------------------- provisioning
+
+const PROVISION = { NATTER_PROVISION: '1' }
+
+const streamNames = async (manager: JetStreamManager) =>
+  ((await manager.streams.names().next()) as string[]).sort()
+
+const FIVE = streamsFor(DEFAULT_FLEET)
+  .map((stream) => stream.name)
+  .sort()
+
+const allFive = (manager: JetStreamManager) =>
+  until(async () => (await streamNames(manager)).length === FIVE.length)
+
+test('with NATTER_PROVISION=1 and no streams a task round-trips with no bootstrap, a worker started first included', async () => {
+  await onFreshServer(
+    async (server, _js, manager) => {
+      const name = freshName()
+      const worker = await startSession({
+        NATTER_ROLE: 'worker',
+        NATTER_NAME: name,
+        NATTER_URL: server.url,
+        NATTER_CREDS_DIR: NO_CREDS,
+        HOME: join(tmpdir(), 'natter-orchestrator-home'),
+        NATTER_TEST_STARTUP_GRACE_MS: String(GRACE_MS),
+        NATTER_TEST_STREAM_RETRY_MS: '100',
+        NATTER_TEST_HEARTBEAT_MS: '50',
+      })
+      sessions.push(worker)
+      await until(async () =>
+        (await server.clientNames()).includes(`natter-${name}`),
+      )
+      expect(await streamNames(manager)).toEqual([])
+
+      const s = await startConnected(PROVISION, server.url)
+      await allFive(manager)
+      expect(await streamNames(manager)).toEqual(FIVE)
+      await until(async () => {
+        const { workers } = parsed(await callTool(s, 'list_workers'))
+        return workers.length === 1
+      })
+
+      const { task_id } = parsed(
+        await callTool(s, 'send_task', { to: name, title: 't', prompt: 'p' }),
+      )
+      await pushCount(worker, 1)
+      await callTool(worker, 'update_task', { task_id })
+      const finish = await callTool(worker, 'finish_task', {
+        task_id,
+        outcome: 'succeeded',
+        summary: 'done',
+      })
+
+      expect(finish.isError).toBeFalsy()
+      expect((await pushCount(s, 1))?.meta.task_id).toBe(task_id)
+    },
+    { bootstrap: false },
+  )
+})
+
+test('the streams do not wait for the startup grace', async () => {
+  await onFreshServer(
+    async (server, _js, manager) => {
+      await startOrchestrator(
+        { ...PROVISION, NATTER_TEST_STARTUP_GRACE_MS: '60000' },
+        server.url,
+      )
+      await allFive(manager)
+    },
+    { bootstrap: false },
+  )
+})
+
+test('NATS coming up after the session still gets the set created', async () => {
+  const server = await startNats({ jetstream: true, autostart: false })
+  await startOrchestrator(PROVISION, server.url)
+  await server.start()
+  const conn = await connect({ servers: server.url })
+  try {
+    await allFive(await jetstreamManager(conn))
+  } finally {
+    await Promise.all(sessions.splice(0).map((s) => s.close()))
+    await conn.close()
+    await server.cleanup()
+  }
+})
+
+test('a lost SENT is never recreated, by a live session or a new one, and its stored results stay', async () => {
+  await onFreshServer(
+    async (server, js, manager) => {
+      const worker = freshName()
+      const live = await startConnected(PROVISION, server.url)
+      await allFive(manager)
+      const { task_id } = await send(live, worker)
+
+      await manager.streams.delete('NATTER_DEFAULT_SENT')
+      await storeResult(worker, task_id, {}, js)
+      const reached = async (count: number) =>
+        until(async () =>
+          durable(manager).then(
+            (info) => info.delivered.consumer_seq >= count,
+            () => false,
+          ),
+        )
+      await reached(1)
+      expect(await streamNames(manager)).not.toContain('NATTER_DEFAULT_SENT')
+      await live.close()
+
+      const next = await startConnected(PROVISION, server.url)
+      // A redelivery means this session is past provisioning.
+      await reached(2)
+      const left = FIVE.filter((name) => name !== 'NATTER_DEFAULT_SENT')
+      expect(await streamNames(manager)).toEqual(left)
+      // Not terminated for having no record: it is still waiting for one.
+      expect((await durable(manager)).num_ack_pending).toBe(1)
+      expect(next.pushes).toEqual([])
+      const reply = await callTool(next, 'list_tasks')
+      expect(reply.isError).toBe(true)
+      expect(reply.content[0]?.text).toContain(HINT)
+    },
+    { bootstrap: false },
+  )
+})
+
+test('with one stream present nothing is created, and the hint stays', async () => {
+  await onFreshServer(
+    async (server, _js, manager) => {
+      await manager.streams.add({ ...TASKS_STREAM })
+      const s = await startConnected(PROVISION, server.url)
+      await Bun.sleep(300)
+
+      expect(await streamNames(manager)).toEqual(['NATTER_DEFAULT_TASKS'])
+      const reply = await callTool(s, 'list_tasks')
+      expect(reply.isError).toBe(true)
+      expect(reply.content[0]?.text).toContain(HINT)
+    },
+    { bootstrap: false },
+  )
+})
+
+test('a session never updates a stream', async () => {
+  await onFreshServer(async (server, _js, manager) => {
+    const { config } = await manager.streams.info('NATTER_DEFAULT_TASKS')
+    await manager.streams.update('NATTER_DEFAULT_TASKS', {
+      ...config,
+      max_msgs_per_subject: 5,
+    })
+    await startConnected(PROVISION, server.url)
+    await until(async () =>
+      durable(manager).then(
+        () => true,
+        () => false,
+      ),
+    )
+
+    const after = await manager.streams.info('NATTER_DEFAULT_TASKS')
+    expect(after.config.max_msgs_per_subject).toBe(5)
+  })
+})
+
+test.each([
+  ['unset', {}],
+  ['not 1', { NATTER_PROVISION: 'true' }],
+])('with NATTER_PROVISION %s no stream is created', async (_, env) => {
+  await onFreshServer(
+    async (server, _js, manager) => {
+      await startConnected(env, server.url)
+      await Bun.sleep(300)
+
+      expect(await streamNames(manager)).toEqual([])
+    },
+    { bootstrap: false },
+  )
+})
+
+test('a create that fails partway reports the failure and the hint, and deletes nothing', async () => {
+  const server = await startNats({ jetstream: true, maxFileStore: '512MiB' })
+  const conn = await connect({ servers: server.url })
+  const manager = await jetstreamManager(conn)
+  try {
+    const failed = await startConnected(PROVISION, server.url)
+    const report = async (s: Session) => {
+      const reply = await callTool(s, 'list_tasks')
+      expect(reply.isError).toBe(true)
+      return reply.content[0]?.text ?? ''
+    }
+    await until(async () =>
+      (await report(failed)).includes('NATTER_DEFAULT_RESULTS'),
+    )
+    expect(await report(failed)).toContain(HINT)
+    expect(await streamNames(manager)).toEqual(['NATTER_DEFAULT_TASKS'])
+
+    // The set is partial now, so the next session leaves it alone.
+    const next = await startConnected(PROVISION, server.url)
+    await Bun.sleep(300)
+    expect(await streamNames(manager)).toEqual(['NATTER_DEFAULT_TASKS'])
+    expect(await report(next)).toContain(HINT)
+  } finally {
+    await Promise.all(sessions.splice(0).map((s) => s.close()))
+    await conn.close()
+    await server.cleanup()
+  }
+})
+
+test('two orchestrators racing on a bare server leave one working set', async () => {
+  await onFreshServer(
+    async (server, _js, manager) => {
+      const [first, second] = await Promise.all([
+        startConnected(PROVISION, server.url),
+        startConnected(PROVISION, server.url),
+      ])
+      await allFive(manager)
+
+      expect(await streamNames(manager)).toEqual(FIVE)
+      await until(async () =>
+        durable(manager).then(
+          () => true,
+          () => false,
+        ),
+      )
+      for (const s of [first, second]) {
+        expect((await listing(s)).tasks).toEqual([])
+      }
+    },
+    { bootstrap: false },
+  )
+})
+
+test('a fleet deleted under a live session stays deleted', async () => {
+  await onFreshServer(
+    async (server, _js, manager) => {
+      await startConnected(PROVISION, server.url)
+      await allFive(manager)
+      await until(async () =>
+        durable(manager).then(
+          () => true,
+          () => false,
+        ),
+      )
+
+      await deleteStreams(manager, streamsFor(DEFAULT_FLEET))
+      await Bun.sleep(400)
+
+      expect(await streamNames(manager)).toEqual([])
     },
     { bootstrap: false },
   )
