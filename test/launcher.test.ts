@@ -259,8 +259,26 @@ describe('dry run, new workspace', () => {
       l[0] === 'herdr' ? l.slice(1, 3).join(' ') || 'attach' : l[0],
     )
 
-  test('from a plain terminal: create, wait, run, wait, attach', async () => {
-    expect(verbs(await route([repo]))).toEqual([
+  const focusOf = (lines: string[][]) =>
+    (lines.find((l) => l[2] === 'create') as string[]).filter((a) =>
+      a.endsWith('focus'),
+    )
+  const down = { HERDR_SERVER_DOWN: '1' }
+
+  test('with the server running: a background workspace, no attach', async () => {
+    const lines = await route([repo])
+    expect(verbs(lines)).toEqual([
+      'workspace create',
+      'pane wait-output',
+      'pane run',
+      'pane wait-output',
+    ])
+    expect(focusOf(lines)).toEqual(['--no-focus'])
+  })
+
+  test('a server this run starts is followed: focus and attach', async () => {
+    const lines = await route([repo], down)
+    expect(verbs(lines)).toEqual([
       'server',
       'workspace create',
       'pane wait-output',
@@ -268,15 +286,36 @@ describe('dry run, new workspace', () => {
       'pane wait-output',
       'attach',
     ])
+    expect(focusOf(lines)).toEqual(['--focus'])
   })
 
-  test('-d does not attach', async () => {
-    const lines = await route(['-d', repo])
+  test('--attach focuses and attaches', async () => {
+    const lines = await route(['--attach', repo])
+    expect(verbs(lines).at(-1)).toBe('attach')
+    expect(focusOf(lines)).toEqual(['--focus'])
+  })
+
+  test('-d never attaches, even for a server it starts', async () => {
+    const lines = await route(['-d', repo], down)
     expect(verbs(lines).at(-1)).toBe('pane wait-output')
+    expect(verbs(lines)).not.toContain('attach')
+    expect(focusOf(lines)).toEqual(['--no-focus'])
   })
 
-  test('-w inside herdr opens a workspace and does not attach or start a server', async () => {
+  test('-d with --attach is refused', async () => {
+    await rm(sb.herdrLog, { force: true })
+    const ran = await runNatter(
+      sb,
+      worker('--fleet', 'x', '-d', '--attach', repo),
+      {},
+    )
+    expect(ran.code).not.toBe(0)
+    expect(await readHerdrCalls(sb)).toEqual([])
+  })
+
+  test('-w inside herdr opens a background workspace and does not attach', async () => {
     const lines = await route(['-w', repo], { HERDR_ENV: '1' })
+    expect(focusOf(lines)).toEqual(['--no-focus'])
     expect(verbs(lines)).toEqual([
       'workspace create',
       'pane wait-output',
@@ -383,6 +422,7 @@ describe('stub run equals the dry run', () => {
 describe('stub herdr', () => {
   const bareHerdr = async (args: string[], env: Record<string, string>) => {
     await rm(sb.herdrLog, { force: true })
+    await rm(`${sb.herdrLog}.up`, { force: true })
     const ran = await runNatter(sb, args, { env })
     expect(ran.code).toBe(0)
     return readHerdrCalls(sb)
@@ -405,7 +445,7 @@ describe('stub herdr', () => {
       spaced,
       '--label',
       'x:api',
-      '--focus',
+      '--no-focus',
       '--env',
       'NATTER_URL=nats://h:4222',
     ])
@@ -423,7 +463,6 @@ describe('stub herdr', () => {
       'pane wait-output',
       'pane run',
       'pane wait-output',
-      '',
     ])
     const run = calls[3] as string[]
     expect(run[2]).toBe('w9:p1')
@@ -453,11 +492,53 @@ describe('stub herdr', () => {
     expect(sent).not.toContain('NATTER_ROLE')
   })
 
-  test('inside herdr there is no attach', async () => {
+  const createFlags = (calls: string[][]) =>
+    (calls.find((c) => c[0] === 'workspace') as string[]).filter((a) =>
+      a.endsWith('focus'),
+    )
+  const attached = (calls: string[][]) => calls.some((c) => c.length === 0)
+
+  test('a running server: no focus, no attach, one line naming the workspace', async () => {
+    await rm(sb.herdrLog, { force: true })
+    const ran = await runNatter(
+      sb,
+      worker('--fleet', 'x', '--name', 'api', repo),
+    )
+    expect(ran.code).toBe(0)
+    expect(ran.stderr).toContain('x:api')
+    const calls = await readHerdrCalls(sb)
+    expect(createFlags(calls)).toEqual(['--no-focus'])
+    expect(attached(calls)).toBe(false)
+  })
+
+  test('a server started by this run: focus and attach', async () => {
+    const calls = await bareHerdr(worker('--fleet', 'x', repo), {
+      HERDR_SERVER_DOWN: '1',
+    })
+    expect(createFlags(calls)).toEqual(['--focus'])
+    expect(attached(calls)).toBe(true)
+  })
+
+  test('--attach: focus and attach', async () => {
+    const calls = await bareHerdr(worker('--fleet', 'x', '--attach', repo), {})
+    expect(createFlags(calls)).toEqual(['--focus'])
+    expect(attached(calls)).toBe(true)
+  })
+
+  test('-d never attaches, even for a server it started', async () => {
+    const calls = await bareHerdr(worker('--fleet', 'x', '-d', repo), {
+      HERDR_SERVER_DOWN: '1',
+    })
+    expect(createFlags(calls)).toEqual(['--no-focus'])
+    expect(attached(calls)).toBe(false)
+  })
+
+  test('-w inside herdr: no focus, no attach', async () => {
     const calls = await bareHerdr(worker('--fleet', 'x', '-w', repo), {
       HERDR_ENV: '1',
     })
-    expect(calls.at(-1)?.[0]).toBe('pane')
+    expect(createFlags(calls)).toEqual(['--no-focus'])
+    expect(attached(calls)).toBe(false)
   })
 
   test('a pane that shows no output gets no command', async () => {

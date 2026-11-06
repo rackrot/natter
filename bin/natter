@@ -16,12 +16,15 @@ Usage:
   --name N     worker name (default: .claude/natter.json, else the directory name)
   -w           open a new herdr workspace even inside a herdr pane
   --here       run in this terminal, whatever herdr says
-  -d           do not attach to the new workspace
+  -d           never attach to the new workspace
+  --attach     focus the new workspace and attach this terminal to it (not with -d)
   -n           print the commands instead of running them
   -h           show this help
 
 Inside a herdr pane (HERDR_ENV=1) the session runs in that pane. Elsewhere it opens a herdr
-workspace and attaches. Arguments after `--` go to claude.
+workspace in the background, without taking focus from open herdr clients, and prints its
+label. It focuses and attaches only when this run started the herdr server, or with --attach.
+Arguments after `--` go to claude.
 EOF2
 }
 
@@ -49,7 +52,8 @@ name=
 force_workspace=0
 here=0
 dashdash=0
-attach=1
+detach=0
+force_attach=0
 dry=0
 while (($#)); do
   case $1 in
@@ -58,7 +62,8 @@ while (($#)); do
     --name) (($# > 1)) || die "--name needs a name"; name=$2; shift 2 ;;
     -w) force_workspace=1; shift ;;
     --here) here=1; shift ;;
-    -d) attach=0; shift ;;
+    -d) detach=1; shift ;;
+    --attach) force_attach=1; shift ;;
     -n) dry=1; shift ;;
     --) dashdash=1; shift; break ;;
     -*) die "unknown option: $1" ;;
@@ -88,6 +93,7 @@ elif [[ -n $name ]]; then
   [[ $name != admin && $name != orchestrator ]] || die "name is reserved, not for a worker: $name"
 fi
 ((! here || ! force_workspace)) || die "--here and -w exclude each other"
+((! detach || ! force_attach)) || die "-d and --attach exclude each other"
 if [[ $role == orchestrator ]]; then
   # An empty directory per fleet, so the read-only session has no project to read.
   dir=${XDG_STATE_HOME:-$HOME/.local/state}/natter/orchestrator/$fleet
@@ -129,7 +135,35 @@ command -v jq >/dev/null || die "jq not found"
 inside=0
 [[ ${HERDR_ENV:-} != 1 ]] || inside=1
 
-create=(workspace create --cwd "$dir" --label "$fleet:${name:-$(basename "$dir")}" --focus)
+label="$fleet:${name:-$(basename "$dir")}"
+# Start the herdr server when it is not running (as claude-orchestrate does).
+# The output is captured first: `| grep -q` under pipefail can fail with SIGPIPE.
+server_running() {
+  local status
+  status=$(herdr status server 2>/dev/null || true)
+  [[ $status == *'status: running'* ]]
+}
+# Focus is shared by every open herdr client, so a background workspace must not take it. A
+# server this run started has no client yet, so then this terminal attaches. A dry run probes too.
+started=0
+if ! server_running; then
+  started=1
+  if ((dry)); then
+    run herdr server
+  else
+    setsid herdr server </dev/null >/dev/null 2>&1 &
+    for _ in $(seq 50); do
+      server_running && break
+      sleep 0.1
+    done
+    server_running || die "herdr server did not start"
+  fi
+fi
+follow=0
+((inside || detach)) || ((! started && ! force_attach)) || follow=1
+
+create=(workspace create --cwd "$dir" --label "$label")
+if ((follow)); then create+=(--focus); else create+=(--no-focus); fi
 for var in "${CONNECTION_VARS[@]}"; do
   [[ -z ${!var:-} ]] || create+=(--env "$var=${!var}")
 done
@@ -149,29 +183,12 @@ for word in "${pane_cmd[@]}"; do
 done
 
 if ((dry)); then
-  ((inside)) || run herdr server
   run herdr "${create[@]}"
   run herdr pane wait-output --regex '\S' --timeout 10000 '<new pane>'
   run herdr pane run '<new pane>' "$pane_line"
   run herdr pane wait-output --match 'natter: starting' --timeout 15000 '<new pane>'
-  ((inside || ! attach)) || run herdr
+  ((! follow)) || run herdr
   exit 0
-fi
-
-# Copied from claude-orchestrate: start the herdr server when it is not running.
-# The output is captured first: `| grep -q` under pipefail can fail with SIGPIPE.
-server_running() {
-  local status
-  status=$(herdr status server 2>/dev/null || true)
-  [[ $status == *'status: running'* ]]
-}
-if ! server_running; then
-  setsid herdr server </dev/null >/dev/null 2>&1 &
-  for _ in $(seq 50); do
-    server_running && break
-    sleep 0.1
-  done
-  server_running || die "herdr server did not start"
 fi
 
 reply=$(herdr "${create[@]}") || die "herdr workspace create failed"
@@ -190,4 +207,5 @@ herdr pane run "$pane" "$pane_line" >/dev/null ||
 herdr pane wait-output --match 'natter: starting' --timeout 15000 "$pane" >/dev/null ||
   echo "natter: no start line from pane $pane; if its prompt is idle, run: $pane_line" >&2
 
-((inside || ! attach)) || exec herdr
+if ((follow)); then exec herdr; fi
+echo "natter: opened workspace $label in the background; find it in your open herdr" >&2

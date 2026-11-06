@@ -92,7 +92,8 @@ export const stubClaude = (sb: Sandbox) => writeStub(sb, 'claude', 'exit 0')
 /**
  * Records each call as NUL-separated argv on one line, and replies with canned
  * JSON, or HERDR_CREATE_REPLY for `workspace create`. A call fails when
- * HERDR_FAIL is a regex that matches its arguments.
+ * HERDR_FAIL is a regex that matches its arguments. `status server` says
+ * running, or with HERDR_SERVER_DOWN set, stopped until `herdr server` is called.
  */
 export const stubHerdr = (sb: Sandbox) =>
   writeStub(
@@ -102,7 +103,8 @@ export const stubHerdr = (sb: Sandbox) =>
 [[ -z \${HERDR_FAIL:-} || ! "$*" =~ $HERDR_FAIL ]] || exit 1
 reply='{"id":"x","result":{"type":"workspace_created","workspace":{"workspace_id":"w9"},"root_pane":{"pane_id":"w9:p1"}}}'
 case "$1 $2" in
-  "status server") echo 'status: running' ;;
+  "status server") [[ -z \${HERDR_SERVER_DOWN:-} || -e "${sb.herdrLog}.up" ]] && echo 'status: running' || echo 'status: stopped' ;;
+  "server ") : > "${sb.herdrLog}.up" ;;
   "workspace create") echo "\${HERDR_CREATE_REPLY:-$reply}" ;;
 esac`,
   )

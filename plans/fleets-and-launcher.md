@@ -168,14 +168,14 @@ Not added: `fleet` in tool replies, `meta` or presence. One session is in one fl
 `bin/natter` is bash. It holds no copy of claude-orchestrate's prompt, shell or env handling.
 
 ```text
-natter orchestrator --fleet F [-w] [--here] [-d] [-n] [-- CLAUDE_ARGS...]
-natter worker --fleet F [--name N] [-w] [--here] [-d] [-n] [DIR] [-- CLAUDE_ARGS...]
+natter orchestrator --fleet F [-w] [--here] [-d | --attach] [-n] [-- CLAUDE_ARGS...]
+natter worker --fleet F [--name N] [-w] [--here] [-d | --attach] [-n] [DIR] [-- CLAUDE_ARGS...]
 ```
 
 | Where it runs | What happens |
 | --- | --- |
 | `--here`, or `HERDR_ENV=1` without `-w` (a pane, including a herdr-plus project) | Sets `NATTER_*` on an `exec` of `claude-orchestrate --no-herdr ... DIR -- <channel flag> --settings <file> "$@"`. The only path that launches claude |
-| Otherwise, or `-w` | `herdr workspace create --cwd DIR --label fleet:name`, then `herdr pane run` of `natter ... --here ...` in the new pane, then attach unless `-d` or already inside herdr |
+| Otherwise, or `-w` | `herdr workspace create --cwd DIR --label fleet:name`, then `herdr pane run` of `natter ... --here ...` in the new pane. It uses `--no-focus` and does not attach, since focus is shared by every open herdr client; only when this run started the herdr server (no client can exist) or with `--attach` does it use `--focus` and attach. `-d` never attaches and excludes `--attach`; inside herdr it never attaches. It prints one stderr line naming the workspace label |
 
 A new workspace re-enters `natter --here`, so both paths are one path, and role, name, fleet and the channel flag reach claude by construction. `--env` carries only connection overrides that are set (`NATTER_URL`, `NATTER_CREDS_DIR`, `NATTER_CA_FILE`, `NATTER_ALLOW_PLAINTEXT`). `NATTER_ROLE` deliberately does not go on the pane: that shell outlives claude, and a plain `claude` typed there later would be a deaf worker pulling tasks.
 
