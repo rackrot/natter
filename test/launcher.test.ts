@@ -20,10 +20,7 @@ import {
 } from './support/stubs'
 
 const ROOT = join(import.meta.dir, '..')
-const CHANNEL = [
-  '--dangerously-load-development-channels',
-  'plugin:nats-channel@natter',
-]
+const CHANNEL = ['--channels', 'plugin:nats-channel@natter']
 const WORKER_SETTINGS = join(ROOT, 'config', 'worker.settings.json')
 const ORCHESTRATOR_SETTINGS = join(ROOT, 'config', 'orchestrator.settings.json')
 

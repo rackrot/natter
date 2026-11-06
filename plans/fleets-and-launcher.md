@@ -283,6 +283,7 @@ Each slice leaves `mise run check` green. Tests follow plan section 5: a real `n
 
 - Files: `bin/natter`, `config/worker.settings.json`, `test/launcher.test.ts`, `test/support/stubs.ts`, `mise.toml` (`shellcheck` tool and lint step).
 - Depends on: nothing in the code. S2 for a real session.
+- Channel flag: the launcher uses `--channels plugin:nats-channel@natter` with no fallback to the development flag. Live-confirmed with `/etc/claude-code/managed-settings.json` (`channelsEnabled`, `allowedChannelPlugins`), which README Install now documents.
 - Live check first, before the workspace route is built: from a plain terminal script, 20 rounds of `workspace create`, the planned wait, `pane run`, reading the result. Clean: ship as designed. Any mangled command: add herdr-plus's echo check, with a retry guarded on `herdr pane process-info` showing the shell in the foreground, so a retry cannot reach Claude's prompt.
 - Test approach. `--dry-run` goes through the same `run` function as the real path, as in claude-orchestrate, and prints each command with `printf %q`. `test/launcher.test.ts` spawns `bin/natter` with `Bun.spawn`, with a stub directory first on `PATH` and a temp `HOME` and `XDG_STATE_HOME`, and splits the line with `bash` to get argv. No test depends on the real `herdr` or `claude`.
   1. Dry-run table: role by route (in pane, plain, `--here`, `-w`, `-d`), asserting env and argv: `NATTER_ROLE`, `NATTER_FLEET`, `NATTER_NAME`, `-a nats-channel:orchestrator`, `--no-herdr`, DIR, the channel flag, `--settings`, trailing claude args in order.

@@ -2,7 +2,7 @@
 
 Interactive sessions on one machine, against a local loopback `nats-server`, started with the `natter` launcher. Run it from the repo checkout in zsh. Terminals: A (NATS server), B (orchestrator), C (worker), D (spare shell), plus E and F for the second fleet in section 9.
 
-Setup once: `mise install`, `mise run setup`, the plugin installed and `natter` on your `PATH`, as in the README. `natter` needs `claude-orchestrate`. Sections 1 to 9 use `--here` so each session runs in its own terminal and needs no herdr. Sections 10 and 11 need herdr and herdr-plus. Every session stops at the development channel dialog, and the first launch in a directory also at the trust dialog. Answer both in each session.
+Setup once: `mise install`, `mise run setup`, the plugin installed and `natter` on your `PATH`, as in the README. The managed settings file from the README's Install section must exist at `/etc/claude-code/managed-settings.json`, or sessions start deaf. `natter` needs `claude-orchestrate`. Sections 1 to 9 use `--here` so each session runs in its own terminal and needs no herdr. Sections 10 and 11 need herdr and herdr-plus. The first launch in a directory stops at the trust dialog. Answer it in each session.
 
 ## 1. Start NATS
 
@@ -189,7 +189,7 @@ working_dir = "api-h"
 TOML
 ```
 
-Open the project from herdr-plus and answer the dialogs in both panes.
+Open the project from herdr-plus and answer any trust dialog in both panes.
 
 Pass:
 - Both panes start a session with no env typed by hand.

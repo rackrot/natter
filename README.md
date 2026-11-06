@@ -44,6 +44,21 @@ The plugin asks for three settings. They are per machine, not per repo:
 
 The environment overrides them: `NATTER_URL`, `NATTER_CREDS_DIR`, `NATTER_CA_FILE`. `mise run bootstrap`, `doctor` and `monitor` read only these variables, never the plugin settings.
 
+### Managed settings for channels
+
+Sessions receive tasks through a channel, which needs a managed settings file. Write this to `/etc/claude-code/managed-settings.json` (as root) on each machine that runs a session:
+
+```json
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [{ "marketplace": "natter", "plugin": "nats-channel" }]
+}
+```
+
+`allowedChannelPlugins` replaces Anthropic's channel allowlist. Official channels stop working on that machine unless you list them too.
+
+A machine without this file starts sessions with no channel. The session runs but is deaf: it gets no tasks and no pushes. Only a startup notice says why.
+
 ## Fleets
 
 A fleet is one orchestrator and its workers. Several fleets can share one NATS server and account, and nothing crosses between them: each fleet has its own five JetStream streams and its own subject prefix, so a session only ever reads its own fleet's records. Two fleets can each have a worker with the same name.
@@ -98,7 +113,7 @@ Add `--nkey ~/.config/natter/natter.nk` (and `--tlsca FILE`) to the `nats` comma
 
 ## Launch
 
-Both roles are interactive sessions, started with `natter`. It wraps `claude-orchestrate`, so workers get the orchestration prompt and shell setup, and it sets `NATTER_ROLE`, `NATTER_FLEET` and `NATTER_NAME`, the development channel flag and the role's `--settings` file (`config/worker.settings.json` or `config/orchestrator.settings.json`).
+Both roles are interactive sessions, started with `natter`. It wraps `claude-orchestrate`, so workers get the orchestration prompt and shell setup, and it sets `NATTER_ROLE`, `NATTER_FLEET` and `NATTER_NAME`, the `--channels` flag and the role's `--settings` file (`config/worker.settings.json` or `config/orchestrator.settings.json`).
 
 ```sh
 natter orchestrator --fleet F [OPTIONS] [-- CLAUDE_ARGS...]
@@ -127,7 +142,7 @@ Where the session runs:
 
 The orchestrator always runs in `${XDG_STATE_HOME:-$HOME/.local/state}/natter/orchestrator/<fleet>`, an empty directory per fleet that `natter` creates (see Orchestrator lockdown).
 
-Every launch stops at the development channel dialog until you press a key, and the first launch in a directory also stops at the trust dialog. Nothing answers them for you, and `-d` leaves the session waiting at the dialog.
+The first launch in a directory stops at the trust dialog. Nothing answers it for you, and `-d` leaves the session waiting at the dialog.
 
 A worker's name is the address tasks go to. It must match `^[a-z0-9][a-z0-9_-]{0,63}$`. `admin` is reserved, and a worker cannot be called `orchestrator`. The name comes from, in order, `--name` (`NATTER_NAME`), `name` in `.claude/natter.json`, then the sanitized directory name of the project. A session with a bad name or no role stays inactive and says why in its server log.
 
@@ -154,7 +169,7 @@ command = "natter worker --fleet x"
 working_dir = "rackrot/api"
 ```
 
-`natter` must be on the `PATH` of the pane's shell. Answer the dialogs in each pane.
+`natter` must be on the `PATH` of the pane's shell. Answer the trust dialog in each new directory's pane.
 
 ### `.claude/natter.json`
 
@@ -171,14 +186,16 @@ Optional, in the repo a worker runs from:
 `natter --here` needs only `claude-orchestrate`. Without that too, start `claude` directly. This skips the orchestration prompt and sets the environment by hand. With `NATTER` set to the checkout path, a worker, from the repo it works on:
 
 ```sh
-NATTER_ROLE=worker NATTER_FLEET=x NATTER_NAME=myrepo claude --dangerously-load-development-channels plugin:nats-channel@natter --settings "$NATTER/config/worker.settings.json"
+NATTER_ROLE=worker NATTER_FLEET=x NATTER_NAME=myrepo claude --channels plugin:nats-channel@natter --settings "$NATTER/config/worker.settings.json"
 ```
 
 Orchestrator, from an empty directory:
 
 ```sh
-NATTER_ROLE=orchestrator NATTER_FLEET=x NATTER_PROVISION=1 claude --agent nats-channel:orchestrator --dangerously-load-development-channels plugin:nats-channel@natter --settings "$NATTER/config/orchestrator.settings.json"
+NATTER_ROLE=orchestrator NATTER_FLEET=x NATTER_PROVISION=1 claude --agent nats-channel:orchestrator --channels plugin:nats-channel@natter --settings "$NATTER/config/orchestrator.settings.json"
 ```
+
+Both forms need the managed settings file. Without it, use `--dangerously-load-development-channels plugin:nats-channel@natter` in place of `--channels plugin:nats-channel@natter`. That flag needs no managed file, but it shows a warning dialog that waits for a keypress.
 
 ## Allow rules
 
@@ -269,7 +286,7 @@ Other attention reasons: `released` (a task was not accepted in time and will be
 
 ## Known limits
 
-- Channels are a research preview. Custom channels need `--dangerously-load-development-channels`. The flag is interactive-only and ignored under `-p` or the Agent SDK, so there are no headless workers.
+- Channels are a research preview. Custom channels need `--channels` and the managed settings file (see Install). Whether `-p` headless workers work with `--channels` is untested.
 - Tested with Claude Code 2.1.318. The plugin relies on Claude Code escaping channel content and does not add its own tag escaping.
 - A deny at a permission prompt fires no hook, so the task stays `waiting_permission` until the worker's next `update_task` or `finish_task`.
 - The `session_error` alert does not stop the retries: it does not fail the task or change the accept timer, so a blocked prompt can be sent again, up to 3 attempts. Whether `StopFailure` fires on a safeguard block is not yet confirmed live.

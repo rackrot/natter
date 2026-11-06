@@ -33,7 +33,7 @@ die() { echo "natter: $*" >&2; exit 1; }
 # Held together with FLEET_PATTERN, NAME_PATTERN and isReserved in src/config.ts by a test.
 FLEET_PATTERN='^[a-z0-9][a-z0-9-]{0,31}$'
 NAME_PATTERN='^[a-z0-9][a-z0-9_-]{0,63}$'
-CHANNEL_FLAG=(--dangerously-load-development-channels plugin:nats-channel@natter)
+CHANNEL_FLAG=(--channels plugin:nats-channel@natter)
 # The only settings a pane gets, and only when set: the pane does not inherit this shell.
 CONNECTION_VARS=(NATTER_URL NATTER_CREDS_DIR NATTER_CA_FILE NATTER_ALLOW_PLAINTEXT)
 
